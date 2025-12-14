@@ -6,16 +6,22 @@ import sys
 sys.modules["sqlite3"] = sys.modules.pop("pysqlite3", sys.modules.get("sqlite3"))
 # ----------------------------------------------------------
 
+import base64
+import io
 import os
 import tempfile
+from typing import List, Tuple
 
 import streamlit as st
 from dotenv import load_dotenv
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.callbacks import get_openai_callback
 
 import indexer
 from agent_graph import get_app_graph
+
+# PyMuPDF + PIL for PDF -> images
+import fitz  # pymupdf
+from PIL import Image
 
 load_dotenv()
 
@@ -24,11 +30,13 @@ st.title("🇪🇺 European Urology: Statistical Compliance Widget")
 
 GUIDELINES_DIR = "./guidelines"
 
-# Pricing references:
-# GPT-5.2: $1.75 in / $14 out per 1M tokens :contentReference[oaicite:2]{index=2}
-# GPT-4.1: $2 in / $8 out per 1M tokens :contentReference[oaicite:3]{index=3}
-# GPT-5 mini: $0.25 in / $2 out per 1M tokens :contentReference[oaicite:4]{index=4}
-# Embeddings: text-embedding-3-large $0.13 / 1M tokens :contentReference[oaicite:5]{index=5}
+# -------- Vision extraction tuning ----------
+VISION_SCALE = 2.0          # 2.0–2.5 improves readability for small risk-table text
+VISION_MAX_PAGES = 12       # max rendered pages
+VISION_SEND_PAGES = 8       # max pages sent to LLM
+VISION_JPEG_QUALITY = 85
+VISION_MAX_SIDE = 1800      # downscale very large renders to reduce token/cost
+# --------------------------------------------
 
 MODEL_PRICING_USD_PER_1M = {
     "gpt-5.2": {"input": 1.75, "output": 14.00},
@@ -37,7 +45,6 @@ MODEL_PRICING_USD_PER_1M = {
     "gpt-4.1": {"input": 2.00, "output": 8.00},
     "gpt-4.1-mini": {"input": 0.80, "output": 3.20},
     "gpt-4.1-nano": {"input": 0.20, "output": 0.80},
-    # If you use other models (e.g., gpt-4o / gpt-4o-mini), add them here.
 }
 
 
@@ -50,6 +57,80 @@ def _estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -
     if not pricing:
         return None
     return (prompt_tokens / 1_000_000) * pricing["input"] + (completion_tokens / 1_000_000) * pricing["output"]
+
+
+def _img_to_data_url(pil_img: Image.Image) -> str:
+    w, h = pil_img.size
+    mx = max(w, h)
+    if mx > VISION_MAX_SIDE:
+        s = VISION_MAX_SIDE / mx
+        pil_img = pil_img.resize((int(w * s), int(h * s)))
+
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=VISION_JPEG_QUALITY)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def _find_candidate_visual_pages(doc: fitz.Document) -> List[int]:
+    """
+    Identify pages likely containing figures/tables/KM plots from their text.
+    Then include neighboring pages (+/-1) to avoid missing embedded graphics pages.
+    """
+    keywords = [
+        "Figure", "Fig.", "Table", "Kaplan", "numbers at risk", "at risk",
+        "cumulative incidence", "confidence interval", "95% CI", "forest plot"
+    ]
+    hits: List[int] = []
+    for i in range(len(doc)):
+        t = (doc[i].get_text("text") or "")
+        if any(k.lower() in t.lower() for k in keywords):
+            hits.append(i)
+
+    if not hits:
+        return list(range(min(VISION_MAX_PAGES, len(doc))))
+
+    # add neighbors
+    expanded = []
+    for i in hits:
+        expanded.extend([i - 1, i, i + 1])
+
+    # dedupe + keep in bounds + keep order
+    seen = set()
+    ordered: List[int] = []
+    for i in expanded:
+        if 0 <= i < len(doc) and i not in seen:
+            seen.add(i)
+            ordered.append(i)
+
+    return ordered[:VISION_MAX_PAGES]
+
+
+def extract_text_and_images(pdf_path: str) -> Tuple[str, List[str]]:
+    """
+    Extract:
+    - full text (best-effort)
+    - selected page images as data URLs (for vision figure/table review)
+    """
+    doc = fitz.open(pdf_path)
+
+    # Full text
+    texts = []
+    for i in range(len(doc)):
+        texts.append(doc[i].get_text("text") or "")
+    full_text = "\n".join(texts)
+
+    # Render candidate visual pages
+    page_indices = _find_candidate_visual_pages(doc)
+
+    images: List[str] = []
+    for i in page_indices:
+        page = doc[i]
+        pix = page.get_pixmap(matrix=fitz.Matrix(VISION_SCALE, VISION_SCALE), alpha=False)
+        pil = Image.open(io.BytesIO(pix.tobytes("jpeg")))
+        images.append(_img_to_data_url(pil))
+
+    return full_text, images
 
 
 # --- ENV CHECK ---
@@ -71,10 +152,10 @@ with st.sidebar:
     st.subheader("Model selection")
 
     recommended_models = [
-        "gpt-4.1",      # strong quality/cost
-        "gpt-5.2",      # max quality (more expensive)
-        "gpt-5-mini",   # fast/cheap
-        "gpt-4.1-mini", # fast/cheap-ish
+        "gpt-4.1",      # vision-capable, strong quality/cost
+        "gpt-5.2",      # may or may not support vision depending on your setup; code falls back if it errors
+        "gpt-5-mini",
+        "gpt-4.1-mini",
     ]
 
     selected_model = st.selectbox("Choose model for this run", recommended_models, index=0)
@@ -82,8 +163,8 @@ with st.sidebar:
     temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
 
     st.caption(
-        "Note: for **reasoning models**, hidden *reasoning tokens* are billed as output tokens. "
-        "Your billing dashboard is the source of truth."
+        "Note: Vision review requires a model that supports image input. "
+        "If the vision call fails, the app will fall back to text-only for figures/tables."
     )
 
     st.divider()
@@ -138,26 +219,30 @@ if uploaded_paper:
                     tmp_path = tmp.name
 
                 try:
-                    loader = PyPDFLoader(tmp_path)
-                    pages = loader.load()
-                    full_text = "\n".join([p.page_content for p in pages])
+                    full_text, page_images = extract_text_and_images(tmp_path)
+
+                    # Show small debug info (optional)
+                    with st.expander("Debug: extracted vision pages"):
+                        st.write(f"Rendered pages for vision: **{min(len(page_images), VISION_MAX_PAGES)}**")
+                        # Show a couple thumbnails so you can confirm it’s capturing the right pages
+                        for img in page_images[:3]:
+                            st.image(img)
 
                     initial_state = {
                         "paper_content": full_text,
                         "paper_type": "",
+                        "paper_images": page_images[:VISION_SEND_PAGES],  # cap sent pages
                         "audit_logs": [],
                         "final_report": "",
                     }
 
                     app_graph = get_app_graph(model_name=selected_model, temperature=temperature)
 
-                    # Capture usage across all LLM calls in the graph
                     with get_openai_callback() as cb:
                         result = app_graph.invoke(initial_state)
 
                     review_md = result["final_report"]
 
-                    # Cost estimate
                     est_cost = _estimate_cost_usd(
                         selected_model,
                         prompt_tokens=cb.prompt_tokens,
@@ -196,4 +281,7 @@ if uploaded_paper:
                 except Exception as e:
                     st.error(f"Error: {e}")
                 finally:
-                    os.remove(tmp_path)
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
