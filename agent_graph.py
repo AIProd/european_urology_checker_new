@@ -422,4 +422,129 @@ Return markdown with EXACTLY:
 Blocking:
 - ...
 Important:
-- .
+- ...
+Minor:
+- ...
+If none for a category, write "- None."
+"""
+
+        combine_template = """
+You are a Statistical Editor for *European Urology*.
+
+Use ONLY the chunk notes below.
+Write a section titled EXACTLY:
+
+### Systematic Review / Meta-analysis Check
+
+Summarize:
+- Any blocking issues.
+- Important but fixable issues.
+- Minor suggestions.
+
+CHUNK NOTES:
+----------------
+{all_chunk_notes}
+----------------
+"""
+
+        # Inject paper type into per-chunk template via simple format before template compilation
+        section = _run_chunked_audit(
+            title="Systematic Review / Meta-analysis Check",
+            rules=rules,
+            paper_text=paper_text,
+            per_chunk_template=per_chunk_template.replace("{ptype}", state.get("paper_type", "Systematic Review")),
+            combine_template=combine_template,
+        )
+        return {"audit_logs": [section]}
+
+    return {
+        "audit_logs": [
+            "### Type-Specific Check\nStudy type does not trigger additional causality or SR/MA checks "
+            "beyond general statistics and figures/tables."
+        ]
+    }
+
+
+def reporter_node(state: AgentState):
+    """Combine logs into a single editorial-style report."""
+    logs_text = "\n\n---\n\n".join(state.get("audit_logs", []))
+
+    if llm is None:
+        fallback = (
+            "🇪🇺 European Urology Statistical Report\n"
+            f"Detected Type: {state.get('paper_type', 'Unknown')}\n\n"
+            "LLM not initialized – showing raw logs:\n\n"
+            f"{logs_text}"
+        )
+        return {"final_report": fallback}
+
+    prompt = ChatPromptTemplate.from_template(
+        """
+You are a Statistical Editor for *European Urology*.
+
+A manuscript has been analyzed by several automated checkers.
+The manuscript type (as classified) is:
+
+> {paper_type}
+
+Below are their raw notes (unordered, with some overlap):
+
+---------------- ANALYSIS NOTES ----------------
+{logs}
+------------------------------------------------
+
+Using ONLY these notes (do not invent details you do not see),
+draft a concise report in markdown with EXACTLY the following structure:
+
+🇪🇺 European Urology Statistical Report
+Detected Type: {paper_type}
+
+Overall summary
+- 2–4 bullet points describing the overall quality of reporting & main themes.
+
+Blocking issues
+- Bullet list of issues that **must** be fixed before acceptance.
+- If none, write: "None."
+
+Important but fixable issues
+- Bullet list of non-fatal but important issues.
+- If none, write: "None."
+
+Minor issues / suggestions
+- Bullet list of minor style, clarity, or presentation suggestions.
+- If none, write: "None."
+
+Provisional recommendation
+- One line with something like:
+  "Acceptable with minor revisions", or
+  "Major revisions required", or
+  "Not acceptable in current form."
+
+Be concrete but not aggressive in tone, and keep the length similar to an internal editorial note.
+        """
+    )
+
+    resp = (prompt | llm).invoke(
+        {"paper_type": state.get("paper_type", "Unknown"), "logs": logs_text}
+    )
+    return {"final_report": resp.content}
+
+
+# --- GRAPH ---
+
+workflow = StateGraph(AgentState)
+
+workflow.add_node("classify", classifier_node)
+workflow.add_node("check_stats", stats_auditor_node)
+workflow.add_node("check_type_specific", type_specific_auditor_node)
+workflow.add_node("check_figtab", figtab_auditor_node)
+workflow.add_node("report", reporter_node)
+
+workflow.set_entry_point("classify")
+workflow.add_edge("classify", "check_stats")
+workflow.add_edge("check_stats", "check_type_specific")
+workflow.add_edge("check_type_specific", "check_figtab")
+workflow.add_edge("check_figtab", "report")
+workflow.add_edge("report", END)
+
+app_graph = workflow.compile()
