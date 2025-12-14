@@ -1,10 +1,10 @@
 # app.py
 
-# --- SQLITE FIX FOR STREAMLIT CLOUD (helps chroma/sqlite) ---
+# --- SQLITE FIX FOR STREAMLIT CLOUD (helps Chroma/sqlite) ---
 __import__("pysqlite3")
 import sys
 sys.modules["sqlite3"] = sys.modules.pop("pysqlite3", sys.modules.get("sqlite3"))
-# ------------------------------------------------------------
+# -----------------------------------------------------------
 
 import os
 import tempfile
@@ -43,7 +43,7 @@ if not os.getenv("OPENAI_API_KEY"):
 with st.sidebar:
     st.header("1. System Setup")
 
-    st.caption(f"Chat model: `{os.getenv('OPENAI_MODEL', 'gpt-5.2')}`")
+    st.caption(f"Chat model: `{os.getenv('OPENAI_MODEL', 'gpt-4o')}`")
     st.caption(f"Embedding model: `{os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-large')}`")
 
     if _guidelines_present():
@@ -92,47 +92,46 @@ st.header("2. Run Compliance Check")
 
 uploaded_paper = st.file_uploader("Upload Manuscript (PDF)", type="pdf")
 
-if uploaded_paper:
-    if st.button("Analyze Manuscript"):
-        if not _guidelines_present():
-            st.error("Upload and build the guideline knowledge base first (left sidebar).")
-        else:
-            with st.spinner("Agent is analyzing..."):
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(uploaded_paper.read())
-                    tmp_path = tmp.name
+if uploaded_paper and st.button("Analyze Manuscript"):
+    if not _guidelines_present():
+        st.error("Upload and build the guideline knowledge base first (left sidebar).")
+    else:
+        with st.spinner("Agent is analyzing..."):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(uploaded_paper.read())
+                tmp_path = tmp.name
 
+            try:
+                loader = PyPDFLoader(tmp_path)
+                pages = loader.load()
+                full_text = "\n".join([p.page_content for p in pages])
+
+                initial_state = {
+                    "paper_content": full_text,
+                    "paper_type": "",
+                    "audit_logs": [],
+                    "final_report": "",
+                }
+
+                result = app_graph.invoke(initial_state)
+
+                st.success("Analysis Complete")
+
+                review_md = result["final_report"]
+                st.markdown(review_md)
+
+                base_name = uploaded_paper.name.rsplit(".", 1)[0]
+                st.download_button(
+                    "💾 Download review (Markdown)",
+                    data=review_md,
+                    file_name=f"{base_name}_eu_stats_review.txt",
+                    mime="text/markdown",
+                )
+
+            except Exception as e:
+                st.error(f"Error: {e}")
+            finally:
                 try:
-                    loader = PyPDFLoader(tmp_path)
-                    pages = loader.load()
-                    full_text = "\n".join([p.page_content for p in pages])
-
-                    initial_state = {
-                        "paper_content": full_text,
-                        "paper_type": "",
-                        "audit_logs": [],
-                        "final_report": "",
-                    }
-
-                    result = app_graph.invoke(initial_state)
-
-                    st.success("Analysis Complete")
-
-                    review_md = result["final_report"]
-                    st.markdown(review_md)
-
-                    base_name = uploaded_paper.name.rsplit(".", 1)[0]
-                    st.download_button(
-                        "💾 Download review (Markdown)",
-                        data=review_md,
-                        file_name=f"{base_name}_eu_stats_review.txt",
-                        mime="text/markdown",
-                    )
-
-                except Exception as e:
-                    st.error(f"Error: {e}")
-                finally:
-                    try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
