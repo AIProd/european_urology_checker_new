@@ -1,8 +1,7 @@
 # indexer.py
-
 import os
 import shutil
-from typing import List, Optional, Dict, Tuple
+from typing import List, Dict, Optional
 
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
@@ -16,8 +15,6 @@ load_dotenv()
 GUIDELINES_DIR = "./guidelines"
 CHROMA_DIR = "./chroma_guidelines"
 CHROMA_COLLECTION = "eu_guidelines"
-
-REQUIRED_GUIDELINE_TYPES = ["statistics", "figures_tables", "causality", "systematic_meta"]
 
 
 def infer_guideline_type(filename: str) -> str:
@@ -90,87 +87,9 @@ def _get_chroma(embedding: OpenAIEmbeddings) -> Chroma:
     )
 
 
-def _safe_collection_count(vs: Chroma) -> int:
-    """
-    Chroma / LangChain versions differ; try a couple ways.
-    """
-    # Newer LC/Chroma typically exposes _collection.count()
-    try:
-        return int(vs._collection.count())  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
-    # Fallback: vs.get() and count ids
-    try:
-        data = vs.get(include=[])
-        ids = data.get("ids") or []
-        return len(ids)
-    except Exception:
-        return 0
-
-
-def validate_knowledge_base(
-    required_types: Optional[List[str]] = None,
-) -> Tuple[bool, str, Dict[str, object]]:
-    """
-    Hard validation that the vector DB exists and is populated.
-    Also checks that each required guideline_type has at least 1 retrievable chunk.
-
-    Returns: (ok, message, details)
-    """
-    required_types = required_types or REQUIRED_GUIDELINE_TYPES
-
-    if not os.path.exists(CHROMA_DIR):
-        return (
-            False,
-            f"Vector DB not found at '{CHROMA_DIR}'. Build/Validate the knowledge base first.",
-            {"exists": False, "total_chunks": 0, "missing_types": required_types},
-        )
-
-    embedding = _get_embedding_function()
-    vs = _get_chroma(embedding)
-
-    total = _safe_collection_count(vs)
-    if total <= 0:
-        return (
-            False,
-            f"Vector DB exists at '{CHROMA_DIR}' but appears EMPTY (0 chunks). Rebuild the knowledge base.",
-            {"exists": True, "total_chunks": total, "missing_types": required_types},
-        )
-
-    missing: List[str] = []
-    for gtype in required_types:
-        try:
-            docs = retrieve_guidelines_by_type(gtype, "guideline", k=1)
-        except Exception:
-            docs = []
-        if not docs:
-            missing.append(gtype)
-
-    if missing:
-        return (
-            False,
-            "Vector DB is present, but some required guideline types have 0 retrievable chunks: "
-            + ", ".join(missing)
-            + ". Re-upload the missing guideline PDFs and rebuild.",
-            {"exists": True, "total_chunks": total, "missing_types": missing},
-        )
-
-    return (
-        True,
-        f"Vector DB OK: {total} chunks available, required types present.",
-        {"exists": True, "total_chunks": total, "missing_types": []},
-    )
-
-
 def build_knowledge_base(force_rebuild: bool = True) -> None:
-    """
-    Builds a persistent Chroma index on disk (./chroma_guidelines).
-    This happens when you click 'Build / Validate Knowledge Base'.
-    """
     docs = _load_guideline_docs()
     chunks = _split_docs(docs)
-
     embedding = _get_embedding_function()
 
     if force_rebuild and os.path.exists(CHROMA_DIR):
@@ -180,10 +99,10 @@ def build_knowledge_base(force_rebuild: bool = True) -> None:
     vs.add_documents(chunks)
     vs.persist()
 
-    # HARD validate after build; fail fast if something went wrong.
-    ok, msg, _ = validate_knowledge_base()
-    if not ok:
-        raise RuntimeError(f"Knowledge base build completed but validation failed: {msg}")
+    # Validation
+    status = get_knowledge_base_status()
+    if not status["ready"]:
+        raise RuntimeError(f"Vector DB build completed but validation failed: {status['details']}")
 
     print(f"✅ Built Chroma KB at {CHROMA_DIR} with {len(chunks)} chunks.")
 
@@ -201,5 +120,64 @@ def retrieve_guidelines_by_type(guideline_type: str, query: str, k: int = 5) -> 
     try:
         return vs.similarity_search(query, k=k, filter={"guideline_type": guideline_type})
     except TypeError:
-        # older versions may use "where"
         return vs.similarity_search(query, k=k, where={"guideline_type": guideline_type})
+
+
+def get_knowledge_base_status(
+    required_types: Optional[List[str]] = None,
+    min_total_chunks: int = 20,
+) -> Dict[str, object]:
+    """
+    Hard readiness check so you can BLOCK runs if the DB is empty/missing key types.
+    """
+    if required_types is None:
+        required_types = ["statistics", "figures_tables", "causality", "systematic_meta"]
+
+    if not os.path.exists(CHROMA_DIR):
+        return {
+            "ready": False,
+            "total_chunks": 0,
+            "type_counts": {},
+            "details": f"Chroma directory not found at {CHROMA_DIR}. Build the KB first.",
+        }
+
+    try:
+        embedding = _get_embedding_function()
+        vs = _get_chroma(embedding)
+
+        total = None
+        type_counts: Dict[str, int] = {}
+
+        # Best effort count
+        try:
+            total = int(vs._collection.count())
+            for t in required_types:
+                try:
+                    type_counts[t] = int(vs._collection.count(where={"guideline_type": t}))
+                except Exception:
+                    # fallback: query-based existence check
+                    type_counts[t] = 1 if len(retrieve_guidelines_by_type(t, "test", k=1)) > 0 else 0
+        except Exception:
+            # fallback if _collection not available
+            total = 0
+            for t in required_types:
+                type_counts[t] = 1 if len(retrieve_guidelines_by_type(t, "test", k=1)) > 0 else 0
+            # if any type exists, we still treat as >0
+            total = sum(type_counts.values())
+
+        missing = [t for t in required_types if type_counts.get(t, 0) <= 0]
+
+        ready = (total is not None and total >= min_total_chunks and len(missing) == 0)
+        details = f"Vector DB {'OK' if ready else 'NOT ready'}: {total} chunks available."
+        if missing:
+            details += f" Missing types: {missing}"
+
+        return {"ready": ready, "total_chunks": total, "type_counts": type_counts, "details": details}
+
+    except Exception as e:
+        return {
+            "ready": False,
+            "total_chunks": 0,
+            "type_counts": {},
+            "details": f"KB status check failed: {e}",
+        }
