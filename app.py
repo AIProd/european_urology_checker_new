@@ -6,22 +6,18 @@ import sys
 sys.modules["sqlite3"] = sys.modules.pop("pysqlite3", sys.modules.get("sqlite3"))
 # ----------------------------------------------------------
 
-import base64
-import io
 import os
 import tempfile
-from typing import List, Tuple
 
 import streamlit as st
 from dotenv import load_dotenv
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.callbacks import get_openai_callback
+from langchain_openai import ChatOpenAI
 
 import indexer
 from agent_graph import get_app_graph
-
-# PyMuPDF + PIL for PDF -> images
-import fitz  # pymupdf
-from PIL import Image
+from pdf_reader import summarize_pdf_visuals
 
 load_dotenv()
 
@@ -29,14 +25,6 @@ st.set_page_config(page_title="EuroUrol Checker", layout="wide")
 st.title("🇪🇺 European Urology: Statistical Compliance Widget")
 
 GUIDELINES_DIR = "./guidelines"
-
-# -------- Vision extraction tuning ----------
-VISION_SCALE = 2.0
-VISION_MAX_PAGES = 12
-VISION_SEND_PAGES = 8
-VISION_JPEG_QUALITY = 85
-VISION_MAX_SIDE = 1800
-# --------------------------------------------
 
 MODEL_PRICING_USD_PER_1M = {
     "gpt-5.2": {"input": 1.75, "output": 14.00},
@@ -49,7 +37,9 @@ MODEL_PRICING_USD_PER_1M = {
 
 
 def _guidelines_present() -> bool:
-    return os.path.exists(GUIDELINES_DIR) and any(f.lower().endswith(".pdf") for f in os.listdir(GUIDELINES_DIR))
+    return os.path.exists(GUIDELINES_DIR) and any(
+        f.lower().endswith(".pdf") for f in os.listdir(GUIDELINES_DIR)
+    )
 
 
 def _estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float | None:
@@ -59,92 +49,15 @@ def _estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -
     return (prompt_tokens / 1_000_000) * pricing["input"] + (completion_tokens / 1_000_000) * pricing["output"]
 
 
-def _img_to_data_url(pil_img: Image.Image) -> str:
-    w, h = pil_img.size
-    mx = max(w, h)
-    if mx > VISION_MAX_SIDE:
-        s = VISION_MAX_SIDE / mx
-        pil_img = pil_img.resize((int(w * s), int(h * s)))
-
-    buf = io.BytesIO()
-    pil_img.save(buf, format="JPEG", quality=VISION_JPEG_QUALITY)
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/jpeg;base64,{b64}"
-
-
-def _find_candidate_visual_pages(doc: fitz.Document) -> List[int]:
-    keywords = [
-        "Figure", "Fig.", "Table", "Kaplan", "numbers at risk", "at risk",
-        "cumulative incidence", "confidence interval", "95% CI", "forest plot"
-    ]
-    hits: List[int] = []
-    for i in range(len(doc)):
-        t = (doc[i].get_text("text") or "")
-        if any(k.lower() in t.lower() for k in keywords):
-            hits.append(i)
-
-    if not hits:
-        return list(range(min(VISION_MAX_PAGES, len(doc))))
-
-    expanded = []
-    for i in hits:
-        expanded.extend([i - 1, i, i + 1])
-
-    seen = set()
-    ordered: List[int] = []
-    for i in expanded:
-        if 0 <= i < len(doc) and i not in seen:
-            seen.add(i)
-            ordered.append(i)
-
-    return ordered[:VISION_MAX_PAGES]
-
-
-def extract_text_and_images(pdf_path: str) -> Tuple[str, List[str]]:
-    doc = fitz.open(pdf_path)
-
-    texts = []
-    for i in range(len(doc)):
-        texts.append(doc[i].get_text("text") or "")
-    full_text = "\n".join(texts)
-
-    page_indices = _find_candidate_visual_pages(doc)
-
-    images: List[str] = []
-    for i in page_indices:
-        page = doc[i]
-        pix = page.get_pixmap(matrix=fitz.Matrix(VISION_SCALE, VISION_SCALE), alpha=False)
-        pil = Image.open(io.BytesIO(pix.tobytes("jpeg")))
-        images.append(_img_to_data_url(pil))
-
-    return full_text, images
-
-
-def _kb_gate_or_stop() -> None:
-    """
-    Hard gate: prevent agent run if vector DB isn't present/loaded.
-    """
-    ok, msg, details = indexer.validate_knowledge_base()
-    if ok:
-        return
-
-    st.error("⚠️ Knowledge base not ready — analysis is blocked.")
-    st.markdown(
-        f"""
-**Reason:** {msg}
-
-**What to do:**
-1) Upload the EU guideline PDFs in the sidebar  
-2) Click **Build / Validate Knowledge Base**  
-3) Re-run the manuscript analysis
-
-**Debug:**  
-- Vector DB exists: `{details.get("exists")}`  
-- Total chunks: `{details.get("total_chunks")}`  
-- Missing types: `{details.get("missing_types")}`
-"""
-    )
-    st.stop()
+def _make_llm(model_name: str, temperature: float = 0.0) -> ChatOpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("Missing OPENAI_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL")
+    kwargs = {"api_key": api_key, "model": model_name, "temperature": temperature}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return ChatOpenAI(**kwargs)
 
 
 # --- ENV CHECK ---
@@ -162,38 +75,27 @@ with st.sidebar:
     else:
         st.warning("⚠️ Guidelines missing. Upload the EU guideline PDFs below.")
 
-    # Show KB status (even before analysis)
-    ok, msg, details = indexer.validate_knowledge_base()
-    if ok:
-        st.success(f"✅ Vector DB ready ({details.get('total_chunks')} chunks)")
-    else:
-        st.warning("⚠️ Vector DB not ready (analysis will be blocked)")
-        st.caption(msg)
-
     st.divider()
-    st.subheader("Model selection")
-
-    recommended_models = [        
-        "gpt-5.2",
-        "gpt-5.2-pro",
-        "gpt-4.1",
-        "gpt-5-mini",
-        "gpt-4.1-mini",
-    ]
-
+    st.subheader("Model selection (text analysis)")
+    recommended_models = ["gpt-4.1", "gpt-5.2", "gpt-5-mini", "gpt-4.1-mini"]
     selected_model = st.selectbox("Choose model for this run", recommended_models, index=0)
     temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
 
     st.divider()
-    st.subheader("Upload / Update Guidelines")
-    st.info(
-        "Upload the guideline PDFs:\n"
-        "- Causality\n"
-        "- Figures and Tables\n"
-        "- Stat Reporting Guidelines\n"
-        "- Systematic review and MA guidelines"
-    )
+    st.subheader("Figure/Table reading (Vision)")
+    use_vision = st.checkbox("Analyze figures/tables from PDF images", value=True)
 
+    # Safer default: use a known multimodal model for vision
+    vision_model = st.selectbox(
+        "Vision model",
+        ["gpt-4.1", "gpt-5.2"],
+        index=0,
+        disabled=not use_vision,
+    )
+    max_vision_pages = st.slider("Max pages to analyze with vision", 2, 12, 8, disabled=not use_vision)
+
+    st.divider()
+    st.subheader("Upload / Update Guidelines")
     uploaded_guidelines = st.file_uploader(
         "Upload Guideline PDFs",
         type="pdf",
@@ -206,7 +108,6 @@ with st.sidebar:
         else:
             with st.spinner("Saving guideline PDFs and building Chroma knowledge base..."):
                 os.makedirs(GUIDELINES_DIR, exist_ok=True)
-
                 for pdf in uploaded_guidelines:
                     save_path = os.path.join(GUIDELINES_DIR, pdf.name)
                     with open(save_path, "wb") as f:
@@ -219,82 +120,113 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"Error while building/validating knowledge base: {e}")
 
+    st.divider()
+    st.subheader("Knowledge base status")
+    kb_status = indexer.get_knowledge_base_status()
+    if kb_status["ready"]:
+        st.success(f"✅ Vector DB ready ({kb_status['total_chunks']} chunks)")
+    else:
+        st.error("❌ Vector DB NOT ready")
+    st.caption(kb_status["details"])
+
 
 # --- MAIN: MANUSCRIPT CHECKER ---
 st.header("2) Run Compliance Check")
-
 uploaded_paper = st.file_uploader("Upload Manuscript (PDF)", type="pdf")
 
 if uploaded_paper:
     if st.button("Analyze Manuscript"):
-        # HARD gate right before run (covers the “sometimes runs without db” case)
-        _kb_gate_or_stop()
-
-        if not _guidelines_present():
-            st.error("Upload the guideline PDFs and rebuild the knowledge base first (left sidebar).")
+        kb_status = indexer.get_knowledge_base_status()
+        if not kb_status["ready"]:
+            st.error(
+                "Vector DB is not ready. Please click **Build / Validate Knowledge Base** in the sidebar and rerun.\n\n"
+                f"Details: {kb_status['details']}"
+            )
             st.stop()
 
-        with st.spinner("Agent is analyzing..."):
+        if not _guidelines_present():
+            st.error("Upload guideline PDFs and build the knowledge base first (left sidebar).")
+            st.stop()
+
+        with st.spinner("Analyzing manuscript (including figures/tables if enabled)..."):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(uploaded_paper.read())
                 tmp_path = tmp.name
 
             try:
-                full_text, page_images = extract_text_and_images(tmp_path)
+                # Extract text (fast)
+                loader = PyPDFLoader(tmp_path)
+                pages = loader.load()
+                full_text = "\n".join([p.page_content for p in pages])
 
-                initial_state = {
-                    "paper_content": full_text,
-                    "paper_type": "",
-                    "paper_images": page_images[:VISION_SEND_PAGES],
-                    "audit_logs": [],
-                    "final_report": "",
-                }
-
-                app_graph = get_app_graph(model_name=selected_model, temperature=temperature)
+                # Extract visuals (true figure reading)
+                paper_visuals = ""
+                visuals_used = False
+                visuals_error = ""
 
                 with get_openai_callback() as cb:
+                    if use_vision:
+                        try:
+                            llm_vision = _make_llm(model_name=vision_model, temperature=0.0)
+                            paper_visuals, _ = summarize_pdf_visuals(
+                                tmp_path,
+                                llm_vision=llm_vision,
+                                max_pages=max_vision_pages,
+                                zoom=2.0,
+                            )
+                            visuals_used = True
+                        except Exception as e:
+                            visuals_error = str(e)
+                            paper_visuals = (
+                                "### Visual extracts (from PDF page images)\n\n"
+                                f"_Vision extraction failed: {visuals_error}_\n"
+                            )
+
+                    initial_state = {
+                        "paper_content": full_text,
+                        "paper_visuals": paper_visuals,
+                        "paper_type": "",
+                        "kb_ready": kb_status["ready"],
+                        "kb_details": kb_status["details"],
+                        "visuals_used": visuals_used,
+                        "audit_logs": [],
+                        "final_report": "",
+                    }
+
+                    app_graph = get_app_graph(model_name=selected_model, temperature=temperature)
                     result = app_graph.invoke(initial_state)
 
-                review_md = result["final_report"]
+                    review_md = result["final_report"]
 
-                # Add an explicit KB status footer so if someone screenshots output,
-                # it always records whether KB was loaded.
-                ok, msg, details = indexer.validate_knowledge_base()
-                kb_stamp = (
-                    "\n\n---\n\n"
-                    "### Knowledge base status\n"
-                    f"- Vector DB ready: **{ok}**\n"
-                    f"- Details: {msg}\n"
-                )
+                    est_cost = _estimate_cost_usd(
+                        selected_model,
+                        prompt_tokens=cb.prompt_tokens,
+                        completion_tokens=cb.completion_tokens,
+                    )
 
-                est_cost = _estimate_cost_usd(
-                    selected_model,
-                    prompt_tokens=cb.prompt_tokens,
-                    completion_tokens=cb.completion_tokens,
-                )
-
-                cost_block = (
-                    "\n\n---\n\n"
-                    "### Run usage & cost estimate\n"
-                    f"- Model: `{selected_model}`\n"
-                    f"- Prompt tokens: **{cb.prompt_tokens:,}**\n"
-                    f"- Output tokens: **{cb.completion_tokens:,}**\n"
-                    f"- Total tokens: **{cb.total_tokens:,}**\n"
-                )
-                if est_cost is None:
-                    cost_block += "- Estimated cost: **N/A (model not in local pricing table)**\n"
-                else:
-                    cost_block += f"- Estimated cost: **${est_cost:.6f}**\n"
-
-                review_md_with_meta = review_md + kb_stamp + cost_block
+                    cost_block = (
+                        "\n\n---\n\n"
+                        "### Run usage & cost estimate\n"
+                        f"- Model: `{selected_model}`\n"
+                        f"- Prompt tokens: **{cb.prompt_tokens:,}**\n"
+                        f"- Output tokens: **{cb.completion_tokens:,}**\n"
+                        f"- Total tokens: **{cb.total_tokens:,}**\n"
+                    )
+                    if est_cost is None:
+                        cost_block += "- Estimated cost: **N/A (model not in local pricing table)**\n"
+                    else:
+                        cost_block += f"- Estimated cost: **${est_cost:.6f}**\n"
 
                 st.success("Analysis Complete")
-                st.markdown(review_md_with_meta)
+                st.markdown(review_md + cost_block)
+
+                with st.expander("🔎 Visual extracts used (debug)"):
+                    st.markdown(paper_visuals)
 
                 base_name = uploaded_paper.name.rsplit(".", 1)[0]
                 st.download_button(
                     "💾 Download review (Markdown)",
-                    data=review_md_with_meta,
+                    data=review_md + cost_block,
                     file_name=f"{base_name}_eu_stats_review.md",
                     mime="text/markdown",
                 )
