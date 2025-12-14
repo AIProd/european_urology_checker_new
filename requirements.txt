@@ -1,0 +1,15 @@
+streamlit
+python-dotenv
+pysqlite3-binary
+
+openai
+langchain
+langchain-core
+langchain-community
+langchain-openai
+langgraph
+
+# Chroma integration (LangChain now recommends langchain-chroma)
+langchain-chroma>=0.1.2
+chromadb
+pypdf
