@@ -10,6 +10,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from indexer import retrieve_guidelines_by_type  # RAG helper
 
 load_dotenv()
@@ -18,6 +20,7 @@ load_dotenv()
 class AgentState(TypedDict):
     paper_content: str
     paper_type: str
+    paper_images: List[str]  # base64 data URLs ("data:image/jpeg;base64,...") for PDF pages
     audit_logs: Annotated[List[str], operator.add]
     final_report: str
 
@@ -66,11 +69,10 @@ def _coerce_category(raw: str) -> str:
         "Other",
     }
     s = (raw or "").strip().strip('"').strip("'")
-    # best-effort normalization
     lower = s.lower()
     if "random" in lower and ("trial" in lower or "rct" in lower):
         return "Randomized Clinical Trial"
-    if "observ" in lower or "cohort" in lower or "case" in lower:
+    if "observ" in lower or "cohort" in lower or "case" in lower or "retrospective" in lower:
         return "Observational Study"
     if "systematic" in lower:
         return "Systematic Review"
@@ -83,8 +85,6 @@ def _coerce_category(raw: str) -> str:
 
 def _make_llm(model_name: str, temperature: float = 0.0) -> ChatOpenAI:
     api_key = _require_env("OPENAI_API_KEY")
-    # Optional:
-    # OPENAI_BASE_URL for proxies / gateways
     base_url = os.getenv("OPENAI_BASE_URL")
     kwargs = {"api_key": api_key, "model": model_name, "temperature": temperature}
     if base_url:
@@ -137,8 +137,7 @@ TEXT:
         try:
             guideline_docs = retrieve_guidelines_by_type(
                 "statistics",
-                "p-values, confidence intervals, precision, effect sizes, "
-                "primary endpoint, sample size",
+                "p-values, confidence intervals, precision, effect sizes, primary endpoint, sample size",
                 k=6,
             )
         except Exception as e:
@@ -188,22 +187,28 @@ If there are essentially no problems, say explicitly that statistical reporting 
         return {"audit_logs": [_get_text(resp)]}
 
     def figtab_auditor_node(state: AgentState):
-        """Check figures and tables against figure/table guidelines."""
+        """
+        Check figures and tables against figure/table guidelines, using:
+        - PDF page images (vision) when available
+        - Fallback to text-only if vision call fails
+        """
         try:
             guideline_docs = retrieve_guidelines_by_type(
                 "figures_tables",
-                "figures tables graphs dos and don'ts precision labels legends "
-                "Kaplan-Meier tables example",
-                k=6,
+                "figures tables graphs labels legends Kaplan-Meier numbers at risk confidence interval shading",
+                k=4,  # keep shorter because we also send images
             )
         except Exception as e:
             return {"audit_logs": [f"### Figures and Tables Check\nCould not load figures/tables guidelines: {e}"]}
 
         rules = "\n\n".join(d.page_content for d in guideline_docs)
-        paper_snip = state["paper_content"]
 
-        prompt = ChatPromptTemplate.from_template(
-            """
+        images = (state.get("paper_images") or [])[:8]
+        if not images:
+            # No images were provided, do a transparent text-only check.
+            paper_snip = state["paper_content"]
+            prompt = ChatPromptTemplate.from_template(
+                """
 You are a Statistical Editor for *European Urology*.
 
 You have the official **Guidelines for Reporting of Figures and Tables for Clinical Research in Urology**.
@@ -213,16 +218,9 @@ Relevant extracts:
 {rules}
 ----------------------------------------------------------
 
-Using those rules, review how the manuscript appears to use **tables and figures**.
-Look for:
-
-- Whether tables/figures complement, rather than duplicate, the text.
-- Whether graphs are used only when they meaningfully improve understanding.
-- Whether labels, units, precision and legends look appropriate.
-- Obvious problems with Kaplan–Meier plots, forest plots, or big summary tables.
-
-You will not see the actual images, but you *can* infer from references in the text
-(e.g. “Table 1”, “Figure 2”, “Kaplan–Meier curve”, etc.).
+You do NOT have access to the figure images. Review the manuscript text
+for figure/table-related issues ONLY where the text explicitly supports it.
+If something cannot be verified from the text, write "Manual check needed".
 
 MANUSCRIPT TEXT:
 ----------------
@@ -236,12 +234,73 @@ Write a short section titled:
 Summarize:
 - Any major violations of the guidelines (blocking if serious).
 - Other important issues.
-- Minor suggestions (e.g., clarity, aesthetics, small formatting fixes).
-            """.strip()
-        )
+- Minor suggestions.
+                """.strip()
+            )
+            resp = (prompt | llm).invoke({"rules": rules, "paper": paper_snip})
+            return {"audit_logs": [_get_text(resp)]}
 
-        resp = (prompt | llm).invoke({"rules": rules, "paper": paper_snip})
-        return {"audit_logs": [_get_text(resp)]}
+        # Vision path: actually look at the page images.
+        system = SystemMessage(content="You are a Statistical Editor for *European Urology*.")
+
+        content_parts = [
+            {
+                "type": "text",
+                "text": (
+                    "You have the official EU Guidelines for Figures and Tables.\n\n"
+                    "---------------- FIGURES/TABLES GUIDELINES ----------------\n"
+                    f"{rules}\n"
+                    "----------------------------------------------------------\n\n"
+                    "You are given PDF page images. Review figures/tables directly from the images.\n"
+                    "Be evidence-driven: only claim something is missing/incorrect if you can see it.\n\n"
+                    "If Kaplan–Meier / cumulative incidence plots are present, explicitly state:\n"
+                    "- Numbers-at-risk shown? (yes/no)\n"
+                    "- 95% CI bands/shading shown? (yes/no/unclear)\n"
+                    "- Axes labeled with endpoint and time origin? (yes/no/unclear)\n\n"
+                    "Write:\n\n### Figures and Tables Check\n"
+                    "- Blocking issues\n"
+                    "- Important but fixable issues\n"
+                    "- Minor suggestions\n"
+                ),
+            }
+        ]
+        for img in images:
+            content_parts.append({"type": "image_url", "image_url": {"url": img}})
+
+        user = HumanMessage(content=content_parts)
+
+        try:
+            resp = llm.invoke([system, user])
+            return {"audit_logs": [_get_text(resp)]}
+        except Exception as e:
+            # Robust fallback: never silently hallucinate; report vision failure and do text-only.
+            paper_snip = state["paper_content"]
+            prompt = ChatPromptTemplate.from_template(
+                """
+### Figures and Tables Check
+
+Vision-based review failed with error: {err}
+
+Proceeding with TEXT-ONLY review (manual image verification still required).
+
+You have the official **Guidelines for Reporting of Figures and Tables for Clinical Research in Urology**.
+
+Relevant extracts:
+---------------- FIGURES/TABLES GUIDELINES ----------------
+{rules}
+----------------------------------------------------------
+
+Review the manuscript text for figure/table issues ONLY where the text explicitly supports it.
+If something cannot be verified from the text, label it "Manual check needed".
+
+MANUSCRIPT TEXT:
+----------------
+{paper}
+----------------
+                """.strip()
+            )
+            resp2 = (prompt | llm).invoke({"rules": rules, "paper": paper_snip, "err": str(e)})
+            return {"audit_logs": [_get_text(resp2)]}
 
     def type_specific_auditor_node(state: AgentState):
         """Causality for observational; SR/MA for systematic/meta."""
@@ -252,7 +311,7 @@ Summarize:
             try:
                 guideline_docs = retrieve_guidelines_by_type(
                     "causality",
-                    "causal language, confounding, causal pathways, introduction, methods, discussion",
+                    "causal language confounding causal pathways introduction methods discussion",
                     k=6,
                 )
             except Exception as e:
@@ -278,9 +337,8 @@ Using those guidelines, review the manuscript for **causal language and causal t
 Focus on:
 - Does the Introduction clearly state whether the question is causal vs descriptive/predictive?
 - Are causal mechanisms/pathways described when appropriate?
-- Are confounders and their treatment described in the Methods (not just “we adjusted for…”)? 
-- Is the Results/Discussion language (“reduces risk”, “improves outcomes”, “associated with”) appropriate
-  given the design and analysis?
+- Are confounders and their treatment described in the Methods (not just “we adjusted for…”)?
+- Is the Results/Discussion language (“reduces risk”, “improves outcomes”, “associated with”) appropriate?
 
 MANUSCRIPT TEXT:
 ----------------
@@ -306,7 +364,7 @@ Under that heading, summarize:
             try:
                 guideline_docs = retrieve_guidelines_by_type(
                     "systematic_meta",
-                    "PRISMA MOOSE heterogeneity SUCRA protocol reproducible methods justification for review",
+                    "PRISMA MOOSE heterogeneity SUCRA protocol reproducible methods",
                     k=6,
                 )
             except Exception as e:
@@ -331,7 +389,6 @@ Using those guidelines, review the manuscript for:
 
 - PRISMA/MOOSE-style reporting (flow, inclusion/exclusion, risk of bias).
 - Whether the methodology is reported in enough detail for exact replication.
-- Whether the rationale for doing this review (vs existing reviews) is compelling.
 - Interpretation of heterogeneity, rankings (e.g., SUCRA), and precision.
 
 MANUSCRIPT TEXT:
@@ -344,7 +401,7 @@ Write a section titled:
 ### Systematic Review / Meta-analysis Check
 
 Summarize:
-- Any blocking issues (e.g., non-reproducible methods, misleading rankings).
+- Any blocking issues.
 - Important but fixable issues.
 - Minor suggestions.
                 """.strip()
