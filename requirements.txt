@@ -13,3 +13,5 @@ langgraph
 langchain-chroma>=0.1.2
 chromadb
 pypdf
+pymupdf
+pillow
