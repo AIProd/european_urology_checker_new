@@ -13,6 +13,52 @@ from indexer import retrieve_guidelines_by_type  # our RAG helper
 
 load_dotenv()
 
+def _content_to_text(content) -> str:
+    """
+    LangChain can return message content as:
+      - str
+      - list[dict] content blocks (e.g., [{"type":"text","text":"..."}])
+      - list[str]
+    Convert everything into a single string safely.
+    """
+    if content is None:
+        return ""
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                # common block shapes:
+                # {"type": "text", "text": "..."}
+                if "text" in item and isinstance(item["text"], str):
+                    parts.append(item["text"])
+                    continue
+                # sometimes nested/other keys exist
+                parts.append(str(item))
+                continue
+            parts.append(str(item))
+        return "\n".join([p for p in parts if p]).strip()
+
+    # Fallback for unexpected types
+    return str(content)
+
+
+def _resp_text(resp) -> str:
+    """Handle either a LangChain message or a raw string/list."""
+    # LangChain message objects usually have `.content`
+    if hasattr(resp, "content"):
+        return _content_to_text(getattr(resp, "content"))
+    return _content_to_text(resp)
+
+
 ALLOWED_PAPER_TYPES = {
     "Randomized Clinical Trial",
     "Observational Study",
@@ -114,12 +160,12 @@ def _run_chunked_audit(
         resp = (per_chunk_prompt | llm).invoke(
             {"rules": rules, "paper_chunk": chunk, "chunk_no": i, "chunk_total": len(chunks)}
         )
-        chunk_notes.append(resp.content.strip())
+        chunk_notes.append(_resp_text(resp).content.strip())
 
     combined = (combine_prompt | llm).invoke(
         {"rules": rules, "all_chunk_notes": "\n\n---\n\n".join(chunk_notes)}
     )
-    return combined.content.strip()
+    return _resp_text(combined).strip()
 
 
 # --- NODES ---
@@ -152,7 +198,8 @@ TEXT:
     )
 
     resp = (prompt | llm).invoke({"text": content_snippet})
-    category = resp.content.strip()
+    category = _resp_text(resp).strip().strip('"').splitlines()[0].strip()
+
 
     if category not in ALLOWED_PAPER_TYPES:
         category = "Other"
@@ -527,7 +574,7 @@ Be concrete but not aggressive in tone, and keep the length similar to an intern
     resp = (prompt | llm).invoke(
         {"paper_type": state.get("paper_type", "Unknown"), "logs": logs_text}
     )
-    return {"final_report": resp.content}
+    return {"final_report": _resp_text(resp)}
 
 
 # --- GRAPH ---
