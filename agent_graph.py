@@ -1,5 +1,4 @@
 # agent_graph.py
-
 import operator
 import os
 from functools import lru_cache
@@ -10,17 +9,18 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 
-from langchain_core.messages import HumanMessage, SystemMessage
-
-from indexer import retrieve_guidelines_by_type  # RAG helper
+from indexer import retrieve_guidelines_by_type
 
 load_dotenv()
 
 
 class AgentState(TypedDict):
     paper_content: str
+    paper_visuals: str
     paper_type: str
-    paper_images: List[str]  # base64 data URLs ("data:image/jpeg;base64,...") for PDF pages
+    kb_ready: bool
+    kb_details: str
+    visuals_used: bool
     audit_logs: Annotated[List[str], operator.add]
     final_report: str
 
@@ -33,14 +33,6 @@ def _require_env(name: str) -> str:
 
 
 def _get_text(resp: Any) -> str:
-    """
-    LangChain return types can vary by version:
-    - AIMessage (has .content)
-    - str
-    - list of messages
-    - dict-like
-    This normalizes to a string safely.
-    """
     if resp is None:
         return ""
     if isinstance(resp, str):
@@ -49,10 +41,8 @@ def _get_text(resp: Any) -> str:
         if not resp:
             return ""
         return _get_text(resp[-1])
-    # AIMessage / BaseMessage
     if hasattr(resp, "content"):
         return (resp.content or "").strip()
-    # dict-ish
     if isinstance(resp, dict):
         for k in ("content", "output_text", "text"):
             if k in resp and isinstance(resp[k], str):
@@ -72,7 +62,7 @@ def _coerce_category(raw: str) -> str:
     lower = s.lower()
     if "random" in lower and ("trial" in lower or "rct" in lower):
         return "Randomized Clinical Trial"
-    if "observ" in lower or "cohort" in lower or "case" in lower or "retrospective" in lower:
+    if "observ" in lower or "cohort" in lower or "case" in lower:
         return "Observational Study"
     if "systematic" in lower:
         return "Systematic Review"
@@ -94,14 +84,29 @@ def _make_llm(model_name: str, temperature: float = 0.0) -> ChatOpenAI:
 
 @lru_cache(maxsize=8)
 def get_app_graph(model_name: str, temperature: float = 0.0):
-    """
-    Returns a compiled LangGraph app for the selected model.
-    Cached so switching models doesn't recompile every time.
-    """
     llm = _make_llm(model_name=model_name, temperature=temperature)
 
+    def kb_guard_node(state: AgentState):
+        if not state.get("kb_ready", False):
+            return {
+                "paper_type": "Other",
+                "audit_logs": [
+                    "### Knowledge base check\n"
+                    f"Vector DB ready: **False**\n\n"
+                    f"Details: {state.get('kb_details','(no details)')}\n\n"
+                    "⚠️ Blocking run: guidelines are not available in the vector DB.\n"
+                    "Rebuild/validate the KB from the sidebar and rerun."
+                ],
+            }
+        return {
+            "audit_logs": [
+                "### Knowledge base check\n"
+                f"Vector DB ready: **True**\n\n"
+                f"Details: {state.get('kb_details','')}"
+            ]
+        }
+
     def classifier_node(state: AgentState):
-        """Classify manuscript type from abstract/intro."""
         content_snippet = state["paper_content"][:4000]
 
         prompt = ChatPromptTemplate.from_template(
@@ -133,7 +138,6 @@ TEXT:
         }
 
     def stats_auditor_node(state: AgentState):
-        """Check general statistical reporting against stats guidelines."""
         try:
             guideline_docs = retrieve_guidelines_by_type(
                 "statistics",
@@ -143,8 +147,10 @@ TEXT:
         except Exception as e:
             return {"audit_logs": [f"### Statistical Reporting Check\nCould not load statistics guidelines: {e}"]}
 
+        if not guideline_docs:
+            return {"audit_logs": ["### Statistical Reporting Check\nNo statistics guideline chunks retrieved (KB issue)."]}
+
         rules = "\n\n".join(d.page_content for d in guideline_docs)
-        paper_snip = state["paper_content"]
 
         prompt = ChatPromptTemplate.from_template(
             """
@@ -157,327 +163,212 @@ Here are relevant extracts:
 {rules}
 ---------------------------------------------------------
 
-Now check the following manuscript text for **statistical reporting** issues,
-using those guidelines as your reference. Focus on:
-
-- Whether effect estimates have confidence intervals and appropriate precision.
-- Whether p-values are used and interpreted according to the guidelines.
-- Whether primary/secondary endpoints and analysis methods are clearly reported.
-- Any obviously misleading or non-guideline-concordant statistical reporting.
-
 MANUSCRIPT TEXT:
 ----------------
 {paper}
 ----------------
 
-Write a short section titled:
+VISUAL EXTRACTS (FIGURES/TABLES FROM PDF IMAGES):
+----------------
+{visuals}
+----------------
+
+Check the manuscript for statistical reporting issues using the guidelines.
+Only flag figure/table problems if supported by VISUAL EXTRACTS or the manuscript text.
+Do NOT guess.
+
+Write:
 
 ### Statistical Reporting Check
 
-Within it, list:
-- 1–3 **blocking issues** (if any) that would prevent acceptance.
-- 2–4 **important but fixable** issues (if any).
-- Any **minor suggestions**.
-
-If there are essentially no problems, say explicitly that statistical reporting appears compliant.
+- 1–3 **blocking issues**
+- 2–4 **important but fixable** issues
+- Any **minor suggestions**
             """.strip()
         )
 
-        resp = (prompt | llm).invoke({"rules": rules, "paper": paper_snip})
+        resp = (prompt | llm).invoke(
+            {"rules": rules, "paper": state["paper_content"], "visuals": state.get("paper_visuals", "")}
+        )
         return {"audit_logs": [_get_text(resp)]}
 
     def figtab_auditor_node(state: AgentState):
-        """
-        Check figures and tables against figure/table guidelines, using:
-        - PDF page images (vision) when available
-        - Fallback to text-only if vision call fails
-        """
         try:
             guideline_docs = retrieve_guidelines_by_type(
                 "figures_tables",
-                "figures tables graphs labels legends Kaplan-Meier numbers at risk confidence interval shading",
-                k=4,  # keep shorter because we also send images
+                "figures tables graphs dos and don'ts precision labels legends Kaplan-Meier numbers-at-risk CI bands",
+                k=6,
             )
         except Exception as e:
             return {"audit_logs": [f"### Figures and Tables Check\nCould not load figures/tables guidelines: {e}"]}
 
+        if not guideline_docs:
+            return {"audit_logs": ["### Figures and Tables Check\nNo figures/tables guideline chunks retrieved (KB issue)."]}
+
         rules = "\n\n".join(d.page_content for d in guideline_docs)
 
-        images = (state.get("paper_images") or [])[:8]
-        if not images:
-            # No images were provided, do a transparent text-only check.
-            paper_snip = state["paper_content"]
-            prompt = ChatPromptTemplate.from_template(
-                """
+        prompt = ChatPromptTemplate.from_template(
+            """
 You are a Statistical Editor for *European Urology*.
 
-You have the official **Guidelines for Reporting of Figures and Tables for Clinical Research in Urology**.
+You have the official **Guidelines for Reporting of Figures and Tables**.
 
-Relevant extracts:
 ---------------- FIGURES/TABLES GUIDELINES ----------------
 {rules}
-----------------------------------------------------------
+-----------------------------------------------------------
 
-You do NOT have access to the figure images. Review the manuscript text
-for figure/table-related issues ONLY where the text explicitly supports it.
-If something cannot be verified from the text, write "Manual check needed".
+Below are extracted summaries from the ACTUAL PDF page images.
+Treat them as evidence. If a detail is not in these extracts, you must NOT claim it.
 
-MANUSCRIPT TEXT:
+VISUAL EXTRACTS (FROM PDF IMAGES):
+----------------
+{visuals}
+----------------
+
+MANUSCRIPT TEXT (for captions/cross-reference only):
 ----------------
 {paper}
 ----------------
 
-Write a short section titled:
+Write:
 
 ### Figures and Tables Check
 
-Summarize:
-- Any major violations of the guidelines (blocking if serious).
-- Other important issues.
-- Minor suggestions.
-                """.strip()
-            )
-            resp = (prompt | llm).invoke({"rules": rules, "paper": paper_snip})
-            return {"audit_logs": [_get_text(resp)]}
+- Any **blocking** violations (only if supported by the visual extracts)
+- Other important issues
+- Minor suggestions
+            """.strip()
+        )
 
-        # Vision path: actually look at the page images.
-        system = SystemMessage(content="You are a Statistical Editor for *European Urology*.")
-
-        content_parts = [
-            {
-                "type": "text",
-                "text": (
-                    "You have the official EU Guidelines for Figures and Tables.\n\n"
-                    "---------------- FIGURES/TABLES GUIDELINES ----------------\n"
-                    f"{rules}\n"
-                    "----------------------------------------------------------\n\n"
-                    "You are given PDF page images. Review figures/tables directly from the images.\n"
-                    "Be evidence-driven: only claim something is missing/incorrect if you can see it.\n\n"
-                    "If Kaplan–Meier / cumulative incidence plots are present, explicitly state:\n"
-                    "- Numbers-at-risk shown? (yes/no)\n"
-                    "- 95% CI bands/shading shown? (yes/no/unclear)\n"
-                    "- Axes labeled with endpoint and time origin? (yes/no/unclear)\n\n"
-                    "Write:\n\n### Figures and Tables Check\n"
-                    "- Blocking issues\n"
-                    "- Important but fixable issues\n"
-                    "- Minor suggestions\n"
-                ),
-            }
-        ]
-        for img in images:
-            content_parts.append({"type": "image_url", "image_url": {"url": img}})
-
-        user = HumanMessage(content=content_parts)
-
-        try:
-            resp = llm.invoke([system, user])
-            return {"audit_logs": [_get_text(resp)]}
-        except Exception as e:
-            # Robust fallback: never silently hallucinate; report vision failure and do text-only.
-            paper_snip = state["paper_content"]
-            prompt = ChatPromptTemplate.from_template(
-                """
-### Figures and Tables Check
-
-Vision-based review failed with error: {err}
-
-Proceeding with TEXT-ONLY review (manual image verification still required).
-
-You have the official **Guidelines for Reporting of Figures and Tables for Clinical Research in Urology**.
-
-Relevant extracts:
----------------- FIGURES/TABLES GUIDELINES ----------------
-{rules}
-----------------------------------------------------------
-
-Review the manuscript text for figure/table issues ONLY where the text explicitly supports it.
-If something cannot be verified from the text, label it "Manual check needed".
-
-MANUSCRIPT TEXT:
-----------------
-{paper}
-----------------
-                """.strip()
-            )
-            resp2 = (prompt | llm).invoke({"rules": rules, "paper": paper_snip, "err": str(e)})
-            return {"audit_logs": [_get_text(resp2)]}
+        resp = (prompt | llm).invoke(
+            {"rules": rules, "visuals": state.get("paper_visuals", ""), "paper": state["paper_content"]}
+        )
+        return {"audit_logs": [_get_text(resp)]}
 
     def type_specific_auditor_node(state: AgentState):
-        """Causality for observational; SR/MA for systematic/meta."""
         paper_type = (state.get("paper_type") or "").lower()
-        paper_snip = state["paper_content"]
+        if "observational" not in paper_type:
+            return {
+                "audit_logs": [
+                    "### Type-Specific Check\nStudy type does not trigger additional causality or SR/MA checks."
+                ]
+            }
 
-        if "observational" in paper_type:
-            try:
-                guideline_docs = retrieve_guidelines_by_type(
-                    "causality",
-                    "causal language confounding causal pathways introduction methods discussion",
-                    k=6,
-                )
-            except Exception as e:
-                return {"audit_logs": [f"### Causality / Observational Study Check\nCould not load causality guidelines: {e}"]}
+        try:
+            guideline_docs = retrieve_guidelines_by_type(
+                "causality",
+                "causal language, confounding, causal pathways, introduction, methods, discussion",
+                k=6,
+            )
+        except Exception as e:
+            return {"audit_logs": [f"### Causality / Observational Study Check\nCould not load causality guidelines: {e}"]}
 
-            rules = "\n\n".join(d.page_content for d in guideline_docs)
+        if not guideline_docs:
+            return {"audit_logs": ["### Causality / Observational Study Check\nNo causality guideline chunks retrieved (KB issue)."]}
 
-            prompt = ChatPromptTemplate.from_template(
-                """
+        rules = "\n\n".join(d.page_content for d in guideline_docs)
+
+        prompt = ChatPromptTemplate.from_template(
+            """
 You are a Statistical Editor for *European Urology*.
 
-The manuscript has been classified as an **Observational Study**.
+The manuscript is an **Observational Study**.
 
-You have the official **Guidelines for Reporting Observational Research in Urology: The Importance of Clear Reference to Causality**.
-
-Relevant extracts:
 ---------------- CAUSALITY GUIDELINES ----------------
 {rules}
 ------------------------------------------------------
 
-Using those guidelines, review the manuscript for **causal language and causal thinking**.
-
-Focus on:
-- Does the Introduction clearly state whether the question is causal vs descriptive/predictive?
-- Are causal mechanisms/pathways described when appropriate?
-- Are confounders and their treatment described in the Methods (not just “we adjusted for…”)?
-- Is the Results/Discussion language (“reduces risk”, “improves outcomes”, “associated with”) appropriate?
-
 MANUSCRIPT TEXT:
 ----------------
 {paper}
 ----------------
 
-Write a section titled:
+Write:
 
 ### Causality / Observational Study Check
 
-Under that heading, summarize:
-- Causal clarity in aims and introduction.
-- Adequacy of confounding control and discussion.
-- Appropriateness of causal vs associational language.
-- Blocking issues vs smaller wording/interpretation fixes.
-                """.strip()
-            )
+- Are aims framed as causal vs prognostic/associational?
+- Confounding/detection bias clarity
+- Wording fixes and any blocking issues
+            """.strip()
+        )
 
-            resp = (prompt | llm).invoke({"rules": rules, "paper": paper_snip})
-            return {"audit_logs": [_get_text(resp)]}
-
-        if "systematic review" in paper_type or "meta-analysis" in paper_type or "meta analysis" in paper_type:
-            try:
-                guideline_docs = retrieve_guidelines_by_type(
-                    "systematic_meta",
-                    "PRISMA MOOSE heterogeneity SUCRA protocol reproducible methods",
-                    k=6,
-                )
-            except Exception as e:
-                return {"audit_logs": [f"### Systematic Review / Meta-analysis Check\nCould not load SR/MA guidelines: {e}"]}
-
-            rules = "\n\n".join(d.page_content for d in guideline_docs)
-
-            prompt = ChatPromptTemplate.from_template(
-                """
-You are a Statistical Editor for *European Urology*.
-
-The manuscript has been classified as a **{ptype}**.
-
-You have the official **Guidelines for Meta-analyses and Systematic Reviews in Urology**.
-
-Relevant extracts:
----------------- SR/MA GUIDELINES ----------------
-{rules}
---------------------------------------------------
-
-Using those guidelines, review the manuscript for:
-
-- PRISMA/MOOSE-style reporting (flow, inclusion/exclusion, risk of bias).
-- Whether the methodology is reported in enough detail for exact replication.
-- Interpretation of heterogeneity, rankings (e.g., SUCRA), and precision.
-
-MANUSCRIPT TEXT:
-----------------
-{paper}
-----------------
-
-Write a section titled:
-
-### Systematic Review / Meta-analysis Check
-
-Summarize:
-- Any blocking issues.
-- Important but fixable issues.
-- Minor suggestions.
-                """.strip()
-            )
-
-            resp = (prompt | llm).invoke({"rules": rules, "paper": paper_snip, "ptype": state.get("paper_type", "")})
-            return {"audit_logs": [_get_text(resp)]}
-
-        return {
-            "audit_logs": [
-                "### Type-Specific Check\nStudy type does not trigger additional causality or SR/MA checks "
-                "beyond general statistics and figures/tables."
-            ]
-        }
+        resp = (prompt | llm).invoke({"rules": rules, "paper": state["paper_content"]})
+        return {"audit_logs": [_get_text(resp)]}
 
     def reporter_node(state: AgentState):
-        """Combine logs into a single editorial-style report."""
         logs_text = "\n\n---\n\n".join(state.get("audit_logs", []))
 
         prompt = ChatPromptTemplate.from_template(
             """
 You are a Statistical Editor for *European Urology*.
 
-A manuscript has been analyzed by several automated checkers.
-The manuscript type (as classified) is:
+Below are raw notes from automated checkers:
 
-> {paper_type}
-
-Below are their raw notes (unordered, with some overlap):
-
----------------- ANALYSIS NOTES ----------------
+---------------- NOTES ----------------
 {logs}
-------------------------------------------------
+-------------------------------------
 
-Using ONLY these notes (do not invent details you do not see),
-draft a concise report in markdown with EXACTLY the following structure:
+Draft a concise report in markdown with this structure:
 
 🇪🇺 European Urology Statistical Report
 Detected Type: {paper_type}
 
 Overall summary
-- 2–4 bullet points describing the overall quality of reporting & main themes.
+- 2–4 bullets
 
 Blocking issues
-- Bullet list of issues that **must** be fixed before acceptance.
-- If none, write: "None."
+- Bullets, or "None."
 
 Important but fixable issues
-- Bullet list of non-fatal but important issues.
-- If none, write: "None."
+- Bullets, or "None."
 
 Minor issues / suggestions
-- Bullet list of minor style, clarity, or presentation suggestions.
-- If none, write: "None."
+- Bullets, or "None."
 
 Provisional recommendation
-- One line with something like:
-  "Acceptable with minor revisions", or
-  "Major revisions required", or
-  "Not acceptable in current form."
+- One line (e.g., Major revisions required.)
 
-Be concrete but not aggressive in tone, and keep the length similar to an internal editorial note.
+Then append:
+
+Knowledge base status
+- Vector DB ready: {kb_ready}
+- Details: {kb_details}
+
+Visual extraction status
+- Figures/tables analyzed from PDF images: {visuals_used}
+
+Important: do not invent manuscript specifics not supported by the notes.
             """.strip()
         )
 
-        resp = (prompt | llm).invoke({"paper_type": state.get("paper_type", "Unknown"), "logs": logs_text})
+        resp = (prompt | llm).invoke(
+            {
+                "paper_type": state.get("paper_type", "Unknown"),
+                "logs": logs_text,
+                "kb_ready": state.get("kb_ready", False),
+                "kb_details": state.get("kb_details", ""),
+                "visuals_used": state.get("visuals_used", False),
+            }
+        )
         return {"final_report": _get_text(resp)}
 
     workflow = StateGraph(AgentState)
+    workflow.add_node("guard_kb", kb_guard_node)
     workflow.add_node("classify", classifier_node)
     workflow.add_node("check_stats", stats_auditor_node)
     workflow.add_node("check_type_specific", type_specific_auditor_node)
     workflow.add_node("check_figtab", figtab_auditor_node)
     workflow.add_node("report", reporter_node)
 
-    workflow.set_entry_point("classify")
+    workflow.set_entry_point("guard_kb")
+
+    workflow.add_conditional_edges(
+        "guard_kb",
+        lambda s: "classify" if s.get("kb_ready", False) else "report",
+        {"classify": "classify", "report": "report"},
+    )
+
     workflow.add_edge("classify", "check_stats")
     workflow.add_edge("check_stats", "check_type_specific")
     workflow.add_edge("check_type_specific", "check_figtab")
