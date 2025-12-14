@@ -173,13 +173,12 @@ with st.sidebar:
     st.divider()
     st.subheader("Model selection")
 
-    recommended_models = [ 
+    recommended_models = [        
         "gpt-5.2",
         "gpt-5.2-pro",
-        "gpt-5-pro",
+        "gpt-4.1",
         "gpt-5-mini",
         "gpt-4.1-mini",
-        "gpt-4.1",
     ]
 
     selected_model = st.selectbox("Choose model for this run", recommended_models, index=0)
