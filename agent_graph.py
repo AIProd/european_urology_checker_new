@@ -2,62 +2,25 @@
 
 import operator
 import os
-from typing import Annotated, List, TypedDict, Optional
+from typing import Annotated, List, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 
-from indexer import retrieve_guidelines_by_type  # our RAG helper
+from indexer import retrieve_guidelines_by_type
 
 load_dotenv()
 
-def _content_to_text(content) -> str:
-    """
-    LangChain can return message content as:
-      - str
-      - list[dict] content blocks (e.g., [{"type":"text","text":"..."}])
-      - list[str]
-    Convert everything into a single string safely.
-    """
-    if content is None:
-        return ""
+# --- QUALITY / SAFETY DEFAULTS ---
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # set OPENAI_MODEL to your best available
+DEFAULT_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0"))
+DEFAULT_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
 
-    if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if item is None:
-                continue
-            if isinstance(item, str):
-                parts.append(item)
-                continue
-            if isinstance(item, dict):
-                # common block shapes:
-                # {"type": "text", "text": "..."}
-                if "text" in item and isinstance(item["text"], str):
-                    parts.append(item["text"])
-                    continue
-                # sometimes nested/other keys exist
-                parts.append(str(item))
-                continue
-            parts.append(str(item))
-        return "\n".join([p for p in parts if p]).strip()
-
-    # Fallback for unexpected types
-    return str(content)
-
-
-def _resp_text(resp) -> str:
-    """Handle either a LangChain message or a raw string/list."""
-    # LangChain message objects usually have `.content`
-    if hasattr(resp, "content"):
-        return _content_to_text(getattr(resp, "content"))
-    return _content_to_text(resp)
-
+# Chunking avoids context overflow on long manuscripts
+MAX_CHUNK_CHARS = int(os.getenv("PAPER_CHUNK_CHARS", "14000"))
+CHUNK_OVERLAP_CHARS = int(os.getenv("PAPER_CHUNK_OVERLAP_CHARS", "700"))
 
 ALLOWED_PAPER_TYPES = {
     "Randomized Clinical Trial",
@@ -67,14 +30,8 @@ ALLOWED_PAPER_TYPES = {
     "Other",
 }
 
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
-DEFAULT_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0"))
-DEFAULT_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
-DEFAULT_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "").strip()  # e.g., low/medium/high
 
-MAX_CHUNK_CHARS = 14000
-CHUNK_OVERLAP_CHARS = 700
-
+# --- 1. STATE ---
 
 class AgentState(TypedDict):
     paper_content: str
@@ -83,48 +40,87 @@ class AgentState(TypedDict):
     final_report: str
 
 
-def _get_llm() -> ChatOpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("Missing OPENAI_API_KEY.")
+# --- Helpers: robust text extraction (fixes list/str/content issues) ---
 
-    kwargs = {
-        "model": DEFAULT_MODEL,
-        "temperature": DEFAULT_TEMPERATURE,
-        "max_retries": DEFAULT_MAX_RETRIES,
-        "openai_api_key": api_key,
-    }
+def _content_to_text(content) -> str:
+    """
+    LangChain responses can be:
+      - AIMessage (has .content)
+      - str
+      - list of content blocks (dicts) or strings
+    Convert everything to a plain string.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                # common: {"type": "text", "text": "..."}
+                txt = item.get("text")
+                if isinstance(txt, str):
+                    parts.append(txt)
+                else:
+                    parts.append(str(item))
+            else:
+                parts.append(str(item))
+        return "\n".join([p for p in parts if p]).strip()
+    return str(content)
 
-    # Only pass reasoning_effort if user set it (keeps compatibility across models).
-    if DEFAULT_REASONING_EFFORT:
-        kwargs["reasoning_effort"] = DEFAULT_REASONING_EFFORT
 
-    return ChatOpenAI(**kwargs)
+def _as_text(resp) -> str:
+    """Accept AIMessage OR raw string/list and return plain text."""
+    if isinstance(resp, str):
+        return resp
+    if hasattr(resp, "content"):
+        return _content_to_text(getattr(resp, "content"))
+    return _content_to_text(resp)
 
 
-try:
-    llm = _get_llm()
-except Exception as e:
-    print(f"Initialization Warning (LLM): {e}")
-    llm = None
+def _normalize_paper_type(raw: str) -> str:
+    s = (raw or "").strip().strip('"').strip("'")
+    # Take first line if model outputs extra junk
+    s = s.splitlines()[0].strip()
+    # Normalize common variants
+    low = s.lower()
+    if "random" in low and "trial" in low:
+        return "Randomized Clinical Trial"
+    if "observ" in low:
+        return "Observational Study"
+    if "systematic" in low and "review" in low:
+        return "Systematic Review"
+    if "meta" in low:
+        return "Meta-analysis"
+    if s in ALLOWED_PAPER_TYPES:
+        return s
+    return "Other"
 
 
 def _chunk_text(text: str, chunk_size: int, overlap: int) -> List[str]:
     if len(text) <= chunk_size:
         return [text]
-
     chunks: List[str] = []
     start = 0
     while start < len(text):
         end = min(len(text), start + chunk_size)
         chunks.append(text[start:end])
-        if end == len(text):
+        if end >= len(text):
             break
         start = max(0, end - overlap)
     return chunks
 
 
 def _fmt_rule_chunks(docs) -> str:
+    """
+    Render guideline chunks with a simple citation prefix like:
+    [Guideline.pdf p.3]
+    """
     lines: List[str] = []
     for d in docs:
         src = d.metadata.get("source_doc", "unknown.pdf")
@@ -135,20 +131,50 @@ def _fmt_rule_chunks(docs) -> str:
     return "\n\n".join(lines)
 
 
+# --- 2. LLM SETUP ---
+
+def _get_llm() -> ChatOpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("Missing OPENAI_API_KEY.")
+
+    # Some versions of langchain_openai accept different init args.
+    # We try the common one; if it errors, fallback to minimal.
+    try:
+        return ChatOpenAI(
+            model=DEFAULT_MODEL,
+            temperature=DEFAULT_TEMPERATURE,
+            max_retries=DEFAULT_MAX_RETRIES,
+            openai_api_key=api_key,
+        )
+    except TypeError:
+        return ChatOpenAI(
+            model=DEFAULT_MODEL,
+            temperature=DEFAULT_TEMPERATURE,
+            openai_api_key=api_key,
+        )
+
+
+try:
+    llm = _get_llm()
+except Exception as e:
+    print(f"Initialization Warning (LLM): {e}")
+    llm = None
+
+
 def _run_chunked_audit(
     *,
-    title: str,
     rules: str,
     paper_text: str,
     per_chunk_template: str,
     combine_template: str,
 ) -> str:
     """
-    For long manuscripts: run a quick scan per chunk, then a single combine pass.
-    Improves coverage + avoids context overflow.
+    Scan manuscript in chunks -> create chunk notes -> combine into a single section.
+    More coverage + avoids context overflow.
     """
     if llm is None:
-        return f"### {title}\n*Error: LLM not initialized.*"
+        return "*Error: LLM not initialized.*"
 
     chunks = _chunk_text(paper_text, MAX_CHUNK_CHARS, CHUNK_OVERLAP_CHARS)
 
@@ -160,15 +186,15 @@ def _run_chunked_audit(
         resp = (per_chunk_prompt | llm).invoke(
             {"rules": rules, "paper_chunk": chunk, "chunk_no": i, "chunk_total": len(chunks)}
         )
-        chunk_notes.append(_resp_text(resp).content.strip())
+        chunk_notes.append(_as_text(resp).strip())
 
     combined = (combine_prompt | llm).invoke(
-        {"rules": rules, "all_chunk_notes": "\n\n---\n\n".join(chunk_notes)}
+        {"all_chunk_notes": "\n\n---\n\n".join(chunk_notes)}
     )
-    return _resp_text(combined).strip()
+    return _as_text(combined).strip()
 
 
-# --- NODES ---
+# --- 3. NODES ---
 
 def classifier_node(state: AgentState):
     """Classify manuscript type from abstract/intro."""
@@ -198,11 +224,7 @@ TEXT:
     )
 
     resp = (prompt | llm).invoke({"text": content_snippet})
-    category = _resp_text(resp).strip().strip('"').splitlines()[0].strip()
-
-
-    if category not in ALLOWED_PAPER_TYPES:
-        category = "Other"
+    category = _normalize_paper_type(_as_text(resp))
 
     return {
         "paper_type": category,
@@ -218,7 +240,7 @@ def stats_auditor_node(state: AgentState):
     try:
         guideline_docs = retrieve_guidelines_by_type(
             "statistics",
-            "p-values, confidence intervals, precision, effect sizes, primary endpoint, sample size",
+            "p-values confidence intervals precision effect sizes primary endpoint sample size multiplicity",
             k=6,
         )
     except Exception as e:
@@ -235,8 +257,8 @@ You have guideline extracts (with citations):
 {rules}
 ---------------------------------------------------------
 
-Review ONLY this manuscript chunk ({chunk_no}/{chunk_total}). Do NOT assume anything not in this chunk.
-List potential issues as bullets; be conservative.
+Review ONLY this manuscript chunk ({chunk_no}/{chunk_total}).
+Do NOT assume anything not in this chunk. Be conservative.
 
 MANUSCRIPT CHUNK:
 ----------------
@@ -257,17 +279,17 @@ If none for a category, write "- None."
     combine_template = """
 You are a Statistical Editor for *European Urology*.
 
-Below are chunk notes from scanning a manuscript. Use ONLY these notes (do not invent details).
-Write a single consolidated section titled EXACTLY:
+Using ONLY the chunk notes below (do not invent details),
+write a single consolidated section titled EXACTLY:
 
 ### Statistical Reporting Check
 
 Within it, list:
-- 1–3 **blocking issues** (if any) that would prevent acceptance.
+- 1–3 **blocking issues** (if any).
 - 2–4 **important but fixable** issues (if any).
-- Any **minor suggestions**.
+- **minor suggestions**.
 
-If there are essentially no problems, say explicitly that statistical reporting appears compliant.
+If essentially no problems, say explicitly that statistical reporting appears compliant.
 
 CHUNK NOTES:
 ----------------
@@ -276,7 +298,6 @@ CHUNK NOTES:
 """
 
     section = _run_chunked_audit(
-        title="Statistical Reporting Check",
         rules=rules,
         paper_text=paper_text,
         per_chunk_template=per_chunk_template,
@@ -293,7 +314,7 @@ def figtab_auditor_node(state: AgentState):
     try:
         guideline_docs = retrieve_guidelines_by_type(
             "figures_tables",
-            "figures tables graphs labels legends units precision Kaplan-Meier number at risk forest plot",
+            "figures tables labels legends units precision Kaplan-Meier number at risk forest plot",
             k=6,
         )
     except Exception as e:
@@ -311,7 +332,7 @@ You have guideline extracts (with citations):
 ----------------------------------------------------------
 
 Review ONLY this manuscript chunk ({chunk_no}/{chunk_total}).
-You cannot see images; only infer from text mentions (e.g., "Figure 2", "Kaplan–Meier", "Table 1").
+You cannot see images; infer only from text mentions (e.g., "Figure 2", "Kaplan–Meier", "Table 1").
 
 MANUSCRIPT CHUNK:
 ----------------
@@ -332,15 +353,15 @@ If none for a category, write "- None."
     combine_template = """
 You are a Statistical Editor for *European Urology*.
 
-Use ONLY the chunk notes below.
-Write a section titled EXACTLY:
+Using ONLY the chunk notes below,
+write a section titled EXACTLY:
 
 ### Figures and Tables Check
 
 Summarize:
-- Any major violations of the guidelines (blocking if serious).
-- Other important issues.
-- Minor suggestions (clarity/aesthetics/small formatting).
+- blocking issues (if any),
+- important issues,
+- minor suggestions (clarity/aesthetics/small formatting).
 
 CHUNK NOTES:
 ----------------
@@ -349,7 +370,6 @@ CHUNK NOTES:
 """
 
     section = _run_chunked_audit(
-        title="Figures and Tables Check",
         rules=rules,
         paper_text=paper_text,
         per_chunk_template=per_chunk_template,
@@ -359,7 +379,7 @@ CHUNK NOTES:
 
 
 def type_specific_auditor_node(state: AgentState):
-    """Type-specific checks for observational causality or SR/MA."""
+    """Causality checks for observational; SR/MA checks for reviews/meta-analyses."""
     if llm is None:
         return {"audit_logs": ["*Error: LLM not initialized.*"]}
 
@@ -381,8 +401,8 @@ def type_specific_auditor_node(state: AgentState):
         per_chunk_template = """
 You are a Statistical Editor for *European Urology*.
 
-The manuscript is an Observational Study.
-You have guideline extracts (with citations):
+This is an Observational Study.
+Guideline extracts (with citations):
 ---------------- CAUSALITY GUIDELINES ----------------
 {rules}
 ------------------------------------------------------
@@ -409,16 +429,16 @@ If none for a category, write "- None."
         combine_template = """
 You are a Statistical Editor for *European Urology*.
 
-Use ONLY the chunk notes below.
-Write a section titled EXACTLY:
+Using ONLY the chunk notes below,
+write a section titled EXACTLY:
 
 ### Causality / Observational Study Check
 
-Under that heading, summarize:
-- Causal clarity in aims and introduction.
-- Adequacy of confounding control and discussion.
-- Appropriateness of causal vs associational language.
-- Blocking issues vs smaller wording/interpretation fixes.
+Summarize:
+- causal clarity in aims/introduction,
+- confounding control description,
+- appropriateness of causal vs associational language,
+- blocking vs fixable issues.
 
 CHUNK NOTES:
 ----------------
@@ -427,7 +447,6 @@ CHUNK NOTES:
 """
 
         section = _run_chunked_audit(
-            title="Causality / Observational Study Check",
             rules=rules,
             paper_text=paper_text,
             per_chunk_template=per_chunk_template,
@@ -439,7 +458,7 @@ CHUNK NOTES:
         try:
             guideline_docs = retrieve_guidelines_by_type(
                 "systematic_meta",
-                "PRISMA MOOSE heterogeneity protocol reproducible methods risk of bias SUCRA rankings",
+                "PRISMA MOOSE protocol reproducible methods risk of bias heterogeneity SUCRA",
                 k=6,
             )
         except Exception as e:
@@ -450,8 +469,7 @@ CHUNK NOTES:
         per_chunk_template = """
 You are a Statistical Editor for *European Urology*.
 
-The manuscript is a {ptype}.
-You have guideline extracts (with citations):
+Guideline extracts (with citations):
 ---------------- SR/MA GUIDELINES ----------------
 {rules}
 --------------------------------------------------
@@ -478,15 +496,15 @@ If none for a category, write "- None."
         combine_template = """
 You are a Statistical Editor for *European Urology*.
 
-Use ONLY the chunk notes below.
-Write a section titled EXACTLY:
+Using ONLY the chunk notes below,
+write a section titled EXACTLY:
 
 ### Systematic Review / Meta-analysis Check
 
 Summarize:
-- Any blocking issues.
-- Important but fixable issues.
-- Minor suggestions.
+- blocking issues,
+- important but fixable issues,
+- minor suggestions.
 
 CHUNK NOTES:
 ----------------
@@ -494,12 +512,10 @@ CHUNK NOTES:
 ----------------
 """
 
-        # Inject paper type into per-chunk template via simple format before template compilation
         section = _run_chunked_audit(
-            title="Systematic Review / Meta-analysis Check",
             rules=rules,
             paper_text=paper_text,
-            per_chunk_template=per_chunk_template.replace("{ptype}", state.get("paper_type", "Systematic Review")),
+            per_chunk_template=per_chunk_template,
             combine_template=combine_template,
         )
         return {"audit_logs": [section]}
@@ -534,7 +550,7 @@ The manuscript type (as classified) is:
 
 > {paper_type}
 
-Below are their raw notes (unordered, with some overlap):
+Below are their raw notes (with some overlap):
 
 ---------------- ANALYSIS NOTES ----------------
 {logs}
@@ -547,7 +563,7 @@ draft a concise report in markdown with EXACTLY the following structure:
 Detected Type: {paper_type}
 
 Overall summary
-- 2–4 bullet points describing the overall quality of reporting & main themes.
+- 2–4 bullet points describing the overall quality & main themes.
 
 Blocking issues
 - Bullet list of issues that **must** be fixed before acceptance.
@@ -558,26 +574,22 @@ Important but fixable issues
 - If none, write: "None."
 
 Minor issues / suggestions
-- Bullet list of minor style, clarity, or presentation suggestions.
+- Bullet list of minor style/clarity/presentation suggestions.
 - If none, write: "None."
 
 Provisional recommendation
-- One line with something like:
+- One line like:
   "Acceptable with minor revisions", or
   "Major revisions required", or
   "Not acceptable in current form."
-
-Be concrete but not aggressive in tone, and keep the length similar to an internal editorial note.
         """
     )
 
-    resp = (prompt | llm).invoke(
-        {"paper_type": state.get("paper_type", "Unknown"), "logs": logs_text}
-    )
-    return {"final_report": _resp_text(resp)}
+    resp = (prompt | llm).invoke({"paper_type": state.get("paper_type", "Unknown"), "logs": logs_text})
+    return {"final_report": _as_text(resp).strip()}
 
 
-# --- GRAPH ---
+# --- 4. GRAPH ---
 
 workflow = StateGraph(AgentState)
 
