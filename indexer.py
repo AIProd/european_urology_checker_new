@@ -9,7 +9,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings
 from langchain_core.documents import Document
-from langchain_chroma import Chroma
+from langchain_community.vectorstores import Chroma
 
 load_dotenv()
 
@@ -21,7 +21,6 @@ DEFAULT_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-
 
 
 def infer_guideline_type(filename: str) -> str:
-    """Map guideline filename to a high-level type."""
     fn = filename.lower()
     if "causality" in fn:
         return "causality"
@@ -38,7 +37,6 @@ def _get_embedding_function() -> OpenAIEmbeddings:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("Missing OPENAI_API_KEY.")
-
     return OpenAIEmbeddings(
         model=DEFAULT_EMBEDDING_MODEL,
         openai_api_key=api_key,
@@ -46,7 +44,6 @@ def _get_embedding_function() -> OpenAIEmbeddings:
 
 
 def _load_guideline_docs() -> List[Document]:
-    """Load all guideline PDFs as LangChain Documents with guideline_type metadata."""
     if not os.path.exists(GUIDELINES_DIR):
         raise FileNotFoundError(
             f"Guidelines folder '{GUIDELINES_DIR}' not found. "
@@ -56,8 +53,7 @@ def _load_guideline_docs() -> List[Document]:
     pdf_files = [f for f in os.listdir(GUIDELINES_DIR) if f.lower().endswith(".pdf")]
     if not pdf_files:
         raise RuntimeError(
-            f"No PDF files found in {GUIDELINES_DIR}. "
-            "Upload the 4 EU guideline PDFs there."
+            f"No PDF files found in {GUIDELINES_DIR}. Upload the 4 EU guideline PDFs there."
         )
 
     documents: List[Document] = []
@@ -69,7 +65,6 @@ def _load_guideline_docs() -> List[Document]:
         for d in docs:
             d.metadata["source_doc"] = file
             d.metadata["guideline_type"] = gtype
-            # PyPDFLoader typically sets `page` (0-indexed). Keep as-is, we’ll display as +1 later.
         documents.extend(docs)
 
     return documents
@@ -84,30 +79,40 @@ def _split_docs(docs: List[Document]) -> List[Document]:
 
 
 def _open_vectorstore() -> Chroma:
-    embeddings = _get_embedding_function()
+    embedding = _get_embedding_function()
     return Chroma(
         collection_name=CHROMA_COLLECTION,
-        embedding_function=embeddings,
+        embedding_function=embedding,
         persist_directory=CHROMA_DIR,
     )
 
 
+def _persist_if_supported(vs: Chroma) -> None:
+    # Some versions require explicit persist(), others auto-persist.
+    if hasattr(vs, "persist"):
+        try:
+            vs.persist()
+        except Exception:
+            pass
+
+
 def build_knowledge_base(force_rebuild: bool = True) -> None:
     """
-    Build a persistent Chroma DB from the guideline PDFs.
-
-    - On rebuild, clears CHROMA_DIR to avoid duplicates.
-    - Stores all guidelines in one collection with metadata filters.
+    Build persistent Chroma DB from all guideline PDFs.
+    Stores everything in one collection and filters via metadata: guideline_type.
     """
     if force_rebuild and os.path.exists(CHROMA_DIR):
-        shutil.rmtree(CHROMA_DIR, ignore_errors=True)
+        try:
+            shutil.rmtree(CHROMA_DIR, ignore_errors=True)
+        except Exception:
+            pass
 
     os.makedirs(CHROMA_DIR, exist_ok=True)
 
     docs = _load_guideline_docs()
     chunks = _split_docs(docs)
 
-    # Stable IDs help avoid accidental duplication if you ever switch force_rebuild=False.
+    # Stable-ish IDs to reduce duplication risk.
     ids: List[str] = []
     for i, d in enumerate(chunks):
         src = d.metadata.get("source_doc", "unknown.pdf")
@@ -117,31 +122,20 @@ def build_knowledge_base(force_rebuild: bool = True) -> None:
 
     vs = _open_vectorstore()
     vs.add_documents(chunks, ids=ids)
+    _persist_if_supported(vs)
 
-    # Quick validation retrievals
-    tested_types = ["statistics", "figures_tables", "causality", "systematic_meta"]
-    for gtype in tested_types:
+    # Tiny smoke tests
+    for gtype in ["statistics", "figures_tables", "causality", "systematic_meta"]:
         _ = retrieve_guidelines_by_type(gtype, "test", k=1)
 
-    print(f"✅ Knowledge base built. Stored {len(chunks)} chunks in Chroma ({CHROMA_DIR}).")
+    print(f"✅ Knowledge base built. {len(chunks)} chunks stored in {CHROMA_DIR}.")
 
 
-def retrieve_guidelines_by_type(
-    guideline_type: str,
-    query: str,
-    k: int = 5,
-) -> List[Document]:
-    """
-    Retrieve top-k guideline chunks for a given guideline_type using Chroma metadata filtering.
-    Uses MMR for better diversity/coverage.
-    """
+def retrieve_guidelines_by_type(guideline_type: str, query: str, k: int = 5) -> List[Document]:
     if not os.path.exists(CHROMA_DIR):
-        raise RuntimeError(
-            "Chroma DB not found. Build/validate knowledge base from the sidebar first."
-        )
+        raise RuntimeError("Chroma DB not found. Build/validate knowledge base from sidebar first.")
 
     vs = _open_vectorstore()
-
     retriever = vs.as_retriever(
         search_type="mmr",
         search_kwargs={
