@@ -2,7 +2,7 @@
 
 import os
 import shutil
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
@@ -16,6 +16,8 @@ load_dotenv()
 GUIDELINES_DIR = "./guidelines"
 CHROMA_DIR = "./chroma_guidelines"
 CHROMA_COLLECTION = "eu_guidelines"
+
+REQUIRED_GUIDELINE_TYPES = ["statistics", "figures_tables", "causality", "systematic_meta"]
 
 
 def infer_guideline_type(filename: str) -> str:
@@ -88,6 +90,79 @@ def _get_chroma(embedding: OpenAIEmbeddings) -> Chroma:
     )
 
 
+def _safe_collection_count(vs: Chroma) -> int:
+    """
+    Chroma / LangChain versions differ; try a couple ways.
+    """
+    # Newer LC/Chroma typically exposes _collection.count()
+    try:
+        return int(vs._collection.count())  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    # Fallback: vs.get() and count ids
+    try:
+        data = vs.get(include=[])
+        ids = data.get("ids") or []
+        return len(ids)
+    except Exception:
+        return 0
+
+
+def validate_knowledge_base(
+    required_types: Optional[List[str]] = None,
+) -> Tuple[bool, str, Dict[str, object]]:
+    """
+    Hard validation that the vector DB exists and is populated.
+    Also checks that each required guideline_type has at least 1 retrievable chunk.
+
+    Returns: (ok, message, details)
+    """
+    required_types = required_types or REQUIRED_GUIDELINE_TYPES
+
+    if not os.path.exists(CHROMA_DIR):
+        return (
+            False,
+            f"Vector DB not found at '{CHROMA_DIR}'. Build/Validate the knowledge base first.",
+            {"exists": False, "total_chunks": 0, "missing_types": required_types},
+        )
+
+    embedding = _get_embedding_function()
+    vs = _get_chroma(embedding)
+
+    total = _safe_collection_count(vs)
+    if total <= 0:
+        return (
+            False,
+            f"Vector DB exists at '{CHROMA_DIR}' but appears EMPTY (0 chunks). Rebuild the knowledge base.",
+            {"exists": True, "total_chunks": total, "missing_types": required_types},
+        )
+
+    missing: List[str] = []
+    for gtype in required_types:
+        try:
+            docs = retrieve_guidelines_by_type(gtype, "guideline", k=1)
+        except Exception:
+            docs = []
+        if not docs:
+            missing.append(gtype)
+
+    if missing:
+        return (
+            False,
+            "Vector DB is present, but some required guideline types have 0 retrievable chunks: "
+            + ", ".join(missing)
+            + ". Re-upload the missing guideline PDFs and rebuild.",
+            {"exists": True, "total_chunks": total, "missing_types": missing},
+        )
+
+    return (
+        True,
+        f"Vector DB OK: {total} chunks available, required types present.",
+        {"exists": True, "total_chunks": total, "missing_types": []},
+    )
+
+
 def build_knowledge_base(force_rebuild: bool = True) -> None:
     """
     Builds a persistent Chroma index on disk (./chroma_guidelines).
@@ -105,10 +180,10 @@ def build_knowledge_base(force_rebuild: bool = True) -> None:
     vs.add_documents(chunks)
     vs.persist()
 
-    # Tiny validation query per type
-    tested_types = ["statistics", "figures_tables", "causality", "systematic_meta"]
-    for gtype in tested_types:
-        _ = retrieve_guidelines_by_type(gtype, "test", k=1)
+    # HARD validate after build; fail fast if something went wrong.
+    ok, msg, _ = validate_knowledge_base()
+    if not ok:
+        raise RuntimeError(f"Knowledge base build completed but validation failed: {msg}")
 
     print(f"✅ Built Chroma KB at {CHROMA_DIR} with {len(chunks)} chunks.")
 
@@ -123,7 +198,6 @@ def retrieve_guidelines_by_type(guideline_type: str, query: str, k: int = 5) -> 
     embedding = _get_embedding_function()
     vs = _get_chroma(embedding)
 
-    # Chroma metadata filtering API varies slightly by version, so we try both.
     try:
         return vs.similarity_search(query, k=k, filter={"guideline_type": guideline_type})
     except TypeError:
