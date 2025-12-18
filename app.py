@@ -77,7 +77,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Model selection (text analysis)")
-    recommended_models = ["gpt-4.1", "gpt-5.2", "gpt-5-mini", "gpt-4.1-mini"]
+    recommended_models = ["gpt-5.2","gpt-4.1",  "gpt-5-mini", "gpt-4.1-mini"]
     selected_model = st.selectbox("Choose model for this run", recommended_models, index=0)
     temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
 
@@ -88,7 +88,7 @@ with st.sidebar:
     # Safer default: use a known multimodal model for vision
     vision_model = st.selectbox(
         "Vision model",
-        ["gpt-4.1", "gpt-5.2"],
+        ["gpt-5.2","gpt-4.1" ],
         index=0,
         disabled=not use_vision,
     )
