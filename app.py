@@ -92,7 +92,7 @@ with st.sidebar:
         index=0,
         disabled=not use_vision,
     )
-    max_vision_pages = st.slider("Max pages to analyze with vision", 2, 12, 8, disabled=not use_vision)
+    max_vision_pages = st.slider("Max pages to analyze with vision", 2, 20, 14, disabled=not use_vision)
 
     st.divider()
     st.subheader("Upload / Update Guidelines")
