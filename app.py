@@ -51,8 +51,6 @@ def _estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -
 
 def _make_llm(model_name: str, temperature: float = 0.0) -> ChatOpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("Missing OPENAI_API_KEY")
     base_url = os.getenv("OPENAI_BASE_URL")
     kwargs = {"api_key": api_key, "model": model_name, "temperature": temperature}
     if base_url:
@@ -65,64 +63,81 @@ if not os.getenv("OPENAI_API_KEY"):
     st.error("⚠️ Missing OPENAI_API_KEY. Set it in .env (local) or in Streamlit Secrets (cloud).")
     st.stop()
 
+# Try to ensure the shared KB exists (auto-download if KB_ZIP_URL is configured)
+kb_status = indexer.ensure_knowledge_base_present()
+
 
 # --- SIDEBAR: SETUP ---
 with st.sidebar:
     st.header("1) System Setup")
 
-    if _guidelines_present():
-        st.success("✅ Guidelines present in ./guidelines")
-    else:
-        st.warning("⚠️ Guidelines missing. Upload the EU guideline PDFs below.")
+    st.caption("This app uses a shared Chroma knowledge base (KB). Normal users don’t need to upload guideline PDFs.")
+    st.caption("If KB_ZIP_URL is set, the app will auto-download the KB when missing.")
 
     st.divider()
-    st.subheader("Model selection (text analysis)")
-    recommended_models = ["gpt-5.2","gpt-4.1",  "gpt-5-mini", "gpt-4.1-mini"]
-    selected_model = st.selectbox("Choose model for this run", recommended_models, index=0)
-    temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.0, step=0.1)
+    st.subheader("Model selection")
 
-    st.divider()
-    st.subheader("Figure/Table reading (Vision)")
-    use_vision = st.checkbox("Analyze figures/tables from PDF images", value=True)
-
-    # Safer default: use a known multimodal model for vision
-    vision_model = st.selectbox(
-        "Vision model",
-        ["gpt-5.2","gpt-4.1" ],
+    model_name = st.selectbox(
+        "Choose model",
+        options=["gpt-5-mini", "gpt-5.2", "gpt-4.1-mini", "gpt-4.1"],
         index=0,
-        disabled=not use_vision,
     )
-    max_vision_pages = st.slider("Max pages to analyze with vision", 2, 20, 14, disabled=not use_vision)
+
+    temperature = st.slider("Temperature", 0.0, 1.0, 0.0, 0.1)
 
     st.divider()
-    st.subheader("Upload / Update Guidelines")
-    uploaded_guidelines = st.file_uploader(
-        "Upload Guideline PDFs",
-        type="pdf",
-        accept_multiple_files=True,
-    )
+    st.subheader("Optional checks")
+    include_figtab = st.checkbox("Include figures/tables check (slower)", value=True)
+    include_type_specific = st.checkbox("Include study-type specific checks", value=True)
 
-    if st.button("Build / Validate Knowledge Base"):
-        if not uploaded_guidelines:
-            st.error("Please upload the guideline PDFs first.")
-        else:
-            with st.spinner("Saving guideline PDFs and building Chroma knowledge base..."):
-                os.makedirs(GUIDELINES_DIR, exist_ok=True)
-                for pdf in uploaded_guidelines:
-                    save_path = os.path.join(GUIDELINES_DIR, pdf.name)
-                    with open(save_path, "wb") as f:
-                        f.write(pdf.getbuffer())
+    st.divider()
+    st.subheader("Admin: Build / Refresh Knowledge Base")
 
-                try:
-                    indexer.build_knowledge_base(force_rebuild=True)
-                    st.success("✅ Knowledge base built and validated.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error while building/validating knowledge base: {e}")
+    admin_token = os.getenv("ADMIN_TOKEN", "")
+    if admin_token:
+        entered = st.text_input(
+            "Admin token",
+            type="password",
+            help="Required to build/refresh the shared KB for all users.",
+        )
+        is_admin = entered == admin_token
+    else:
+        is_admin = True
+        st.caption("ADMIN_TOKEN is not set; build controls are unlocked.")
+
+    if not is_admin:
+        st.info("KB build/refresh is disabled for non-admin users.")
+    else:
+        # Source PDFs are only needed for (re)building the KB
+        uploaded_guidelines = st.file_uploader(
+            "Upload Guideline PDFs (admin only)",
+            type="pdf",
+            accept_multiple_files=True,
+        )
+
+        force_rebuild = st.checkbox("Force rebuild (wipe existing KB)", value=True)
+
+        if st.button("Build / Validate Knowledge Base"):
+            if not uploaded_guidelines:
+                st.error("Please upload the guideline PDFs first.")
+            else:
+                with st.spinner("Saving guideline PDFs and building Chroma knowledge base..."):
+                    os.makedirs(GUIDELINES_DIR, exist_ok=True)
+                    for pdf in uploaded_guidelines:
+                        save_path = os.path.join(GUIDELINES_DIR, pdf.name)
+                        with open(save_path, "wb") as f:
+                            f.write(pdf.getbuffer())
+
+                    try:
+                        indexer.build_knowledge_base(force_rebuild=force_rebuild)
+                        st.success("✅ Knowledge base built and validated.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error while building/validating knowledge base: {e}")
 
     st.divider()
     st.subheader("Knowledge base status")
-    kb_status = indexer.get_knowledge_base_status()
+    kb_status = indexer.ensure_knowledge_base_present()
     if kb_status["ready"]:
         st.success(f"✅ Vector DB ready ({kb_status['total_chunks']} chunks)")
     else:
@@ -134,96 +149,69 @@ with st.sidebar:
 st.header("2) Run Compliance Check")
 uploaded_paper = st.file_uploader("Upload Manuscript (PDF)", type="pdf")
 
+st.divider()
+st.subheader("Run")
+st.caption("This will extract the paper text and optionally summarize visuals (figures/tables) before running the agents.")
+
 if uploaded_paper:
     if st.button("Analyze Manuscript"):
-        kb_status = indexer.get_knowledge_base_status()
+        kb_status = indexer.ensure_knowledge_base_present()
         if not kb_status["ready"]:
             st.error(
-                "Vector DB is not ready. Please click **Build / Validate Knowledge Base** in the sidebar and rerun.\n\n"
-                f"Details: {kb_status['details']}"
+                "Knowledge base is not ready. Ask the admin to configure KB_ZIP_URL or rebuild the KB in the sidebar."
             )
-            st.stop()
-
-        if not _guidelines_present():
-            st.error("Upload guideline PDFs and build the knowledge base first (left sidebar).")
+            st.caption(kb_status["details"])
             st.stop()
 
         with st.spinner("Analyzing manuscript (including figures/tables if enabled)..."):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(uploaded_paper.read())
+                tmp.write(uploaded_paper.getbuffer())
                 tmp_path = tmp.name
 
             try:
-                # Extract text (fast)
                 loader = PyPDFLoader(tmp_path)
-                pages = loader.load()
-                full_text = "\n".join([p.page_content for p in pages])
+                docs = loader.load()
+                paper_text = "\n\n".join(d.page_content for d in docs)
 
-                # Extract visuals (true figure reading)
                 paper_visuals = ""
-                visuals_used = False
-                visuals_error = ""
+                if include_figtab:
+                    paper_visuals = summarize_pdf_visuals(tmp_path)
+
+                llm = _make_llm(model_name=model_name, temperature=temperature)
+
+                app = get_app_graph(
+                    include_type_specific=include_type_specific,
+                    include_figtab=include_figtab,
+                )
+
+                state = {
+                    "paper_content": paper_text,
+                    "paper_visuals": paper_visuals,
+                    "audit_logs": [],
+                }
 
                 with get_openai_callback() as cb:
-                    if use_vision:
-                        try:
-                            llm_vision = _make_llm(model_name=vision_model, temperature=0.0)
-                            paper_visuals, _ = summarize_pdf_visuals(
-                                tmp_path,
-                                llm_vision=llm_vision,
-                                max_pages=max_vision_pages,
-                                zoom=2.0,
-                            )
-                            visuals_used = True
-                        except Exception as e:
-                            visuals_error = str(e)
-                            paper_visuals = (
-                                "### Visual extracts (from PDF page images)\n\n"
-                                f"_Vision extraction failed: {visuals_error}_\n"
-                            )
+                    result = app.invoke(state)
 
-                    initial_state = {
-                        "paper_content": full_text,
-                        "paper_visuals": paper_visuals,
-                        "paper_type": "",
-                        "kb_ready": kb_status["ready"],
-                        "kb_details": kb_status["details"],
-                        "visuals_used": visuals_used,
-                        "audit_logs": [],
-                        "final_report": "",
-                    }
+                    review_md = "\n\n".join(result.get("audit_logs", []))
 
-                    app_graph = get_app_graph(model_name=selected_model, temperature=temperature)
-                    result = app_graph.invoke(initial_state)
-
-                    review_md = result["final_report"]
-
-                    est_cost = _estimate_cost_usd(
-                        selected_model,
+                    cost_usd = _estimate_cost_usd(
+                        model=model_name,
                         prompt_tokens=cb.prompt_tokens,
                         completion_tokens=cb.completion_tokens,
                     )
-
                     cost_block = (
-                        "\n\n---\n\n"
-                        "### Run usage & cost estimate\n"
-                        f"- Model: `{selected_model}`\n"
-                        f"- Prompt tokens: **{cb.prompt_tokens:,}**\n"
-                        f"- Output tokens: **{cb.completion_tokens:,}**\n"
-                        f"- Total tokens: **{cb.total_tokens:,}**\n"
+                        f"\n\n---\n\n**Tokens**: prompt={cb.prompt_tokens}, completion={cb.completion_tokens}, total={cb.total_tokens}"
                     )
-                    if est_cost is None:
-                        cost_block += "- Estimated cost: **N/A (model not in local pricing table)**\n"
+                    if cost_usd is not None:
+                        cost_block += f"\n\n**Estimated cost**: ${cost_usd:.4f} (USD)"
                     else:
-                        cost_block += f"- Estimated cost: **${est_cost:.6f}**\n"
+                        cost_block += "\n\n**Estimated cost**: (unknown model pricing)"
 
-                st.success("Analysis Complete")
+                st.subheader("✅ Review output")
                 st.markdown(review_md + cost_block)
 
-                with st.expander("🔎 Visual extracts used (debug)"):
-                    st.markdown(paper_visuals)
-
-                base_name = uploaded_paper.name.rsplit(".", 1)[0]
+                base_name = os.path.splitext(uploaded_paper.name)[0]
                 st.download_button(
                     "💾 Download review (Markdown)",
                     data=review_md + cost_block,
@@ -238,3 +226,5 @@ if uploaded_paper:
                     os.remove(tmp_path)
                 except Exception:
                     pass
+else:
+    st.info("Upload a manuscript PDF to begin.")
