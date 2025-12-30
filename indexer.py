@@ -17,99 +17,94 @@ load_dotenv()
 
 GUIDELINES_DIR = "./guidelines"
 CHROMA_DIR = "./chroma_guidelines"
+CHROMA_COLLECTION = "eu_guidelines"
 
 
 def infer_guideline_type(filename: str) -> str:
-    """
-    Heuristic to tag each PDF into one of the guideline types used by the agents.
-    Adjust mappings as your file naming conventions evolve.
-    """
-    fn = filename.lower()
-    if "stat" in fn:
-        return "statistics"
-    if "figure" in fn or "table" in fn or "figtab" in fn:
+    """Heuristic mapping based on filename."""
+    n = filename.lower()
+    if "figure" in n or "table" in n or "fig" in n:
         return "figures_tables"
-    if "causal" in fn:
+    if "causal" in n or "causality" in n:
         return "causality"
-    if "systematic" in fn or "meta" in fn:
+    if "systematic" in n or "meta" in n:
         return "systematic_meta"
-    # default bucket
-    return "statistics"
+    if "stat" in n or "statistics" in n or "p-value" in n:
+        return "statistics"
+    return "other"
 
 
-def _require_env(var_name: str) -> str:
-    v = os.getenv(var_name)
-    if not v:
-        raise RuntimeError(
-            f"Missing environment variable: {var_name}. "
-            "Set it in .env (local) or in Streamlit Secrets (cloud)."
-        )
-    return v
+def _require_env(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
+        raise ValueError(f"Missing env var: {name}")
+    return val
 
 
 def _get_embedding_function() -> OpenAIEmbeddings:
-    _require_env("OPENAI_API_KEY")
-    # You can pin a specific embeddings model if you want; OpenAIEmbeddings will use defaults otherwise.
-    return OpenAIEmbeddings()
+    _ = _require_env("OPENAI_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL")
+    embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
+
+    kwargs = {"model": embedding_model}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return OpenAIEmbeddings(**kwargs)
 
 
 def _load_guideline_docs() -> List[Document]:
     if not os.path.exists(GUIDELINES_DIR):
-        raise RuntimeError(
-            f"Guidelines directory '{GUIDELINES_DIR}' does not exist. "
-            "Admins: upload PDFs in the sidebar (or create the folder locally)."
+        raise FileNotFoundError(
+            f"Guidelines folder not found: {GUIDELINES_DIR}. Create it and add PDFs."
         )
 
-    pdf_files = [f for f in os.listdir(GUIDELINES_DIR) if f.lower().endswith(".pdf")]
-    if not pdf_files:
-        raise RuntimeError(
-            f"No PDF files found in '{GUIDELINES_DIR}'. Admins: upload guideline PDFs in the sidebar."
-        )
+    pdfs = [f for f in os.listdir(GUIDELINES_DIR) if f.lower().endswith(".pdf")]
+    if not pdfs:
+        raise FileNotFoundError(f"No PDFs found in {GUIDELINES_DIR}.")
 
-    all_docs: List[Document] = []
-    for fname in pdf_files:
-        path = os.path.join(GUIDELINES_DIR, fname)
+    docs: List[Document] = []
+    for pdf in pdfs:
+        path = os.path.join(GUIDELINES_DIR, pdf)
         loader = PyPDFLoader(path)
-        docs = loader.load()
-        gtype = infer_guideline_type(fname)
-        for d in docs:
-            d.metadata = d.metadata or {}
-            d.metadata["source"] = fname
+        loaded = loader.load()
+        gtype = infer_guideline_type(pdf)
+        for d in loaded:
             d.metadata["guideline_type"] = gtype
-        all_docs.extend(docs)
-    return all_docs
+            d.metadata["source_pdf"] = pdf
+        docs.extend(loaded)
+
+    return docs
 
 
 def _split_docs(docs: List[Document]) -> List[Document]:
     splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=150)
-    chunks = splitter.split_documents(docs)
-
-    # Ensure each chunk has the expected metadata
-    for c in chunks:
-        c.metadata = c.metadata or {}
-        c.metadata.setdefault("guideline_type", "statistics")
-        c.metadata.setdefault("source", "unknown")
-    return chunks
+    return splitter.split_documents(docs)
 
 
 def _get_chroma(embedding: OpenAIEmbeddings) -> Chroma:
     return Chroma(
+        collection_name=CHROMA_COLLECTION,
         persist_directory=CHROMA_DIR,
         embedding_function=embedding,
-        collection_name="eu_guidelines",
     )
 
 
 def build_knowledge_base(force_rebuild: bool = False) -> None:
-    """
-    Builds/refreshes the knowledge base from PDFs in GUIDELINES_DIR.
-
-    - If force_rebuild=True: wipes CHROMA_DIR before rebuilding.
-    - Otherwise: appends/updates (Chroma behavior depends on ids/collection).
-    """
     docs = _load_guideline_docs()
     chunks = _split_docs(docs)
     embedding = _get_embedding_function()
+
+    # Avoid accidental duplicate-ingestion:
+    # If the KB is already ready and force_rebuild is False, do nothing.
+    if (not force_rebuild) and os.path.exists(CHROMA_DIR):
+        try:
+            status = get_knowledge_base_status()
+            if status.get("ready"):
+                print(f"ℹ️ KB already ready at {CHROMA_DIR}. Skipping rebuild.")
+                return
+        except Exception:
+            # If status check fails, continue with build attempt.
+            pass
 
     if force_rebuild and os.path.exists(CHROMA_DIR):
         shutil.rmtree(CHROMA_DIR, ignore_errors=True)
@@ -123,25 +118,19 @@ def build_knowledge_base(force_rebuild: bool = False) -> None:
     if not status["ready"]:
         raise RuntimeError(f"Vector DB build completed but validation failed: {status['details']}")
 
+    print(f"✅ Built Chroma KB at {CHROMA_DIR} with {len(chunks)} chunks.")
 
-def retrieve_guidelines_by_type(guideline_type: str, query: str, k: int = 5) -> List[Document]:
-    # If KB isn't on disk, try to fetch it (e.g., from GitHub) before failing.
-    ensure_knowledge_base_present()
 
-    if not os.path.exists(CHROMA_DIR):
-        raise RuntimeError(
-            f"Chroma KB not found at '{CHROMA_DIR}'. "
-            "Admin: build/refresh the KB in the sidebar, or configure KB_ZIP_URL."
-        )
-
+def retrieve_guidelines_by_type(guideline_type: str, query: str, k: int = 6) -> List[str]:
     embedding = _get_embedding_function()
     vs = _get_chroma(embedding)
 
-    try:
-        return vs.similarity_search(query, k=k, filter={"guideline_type": guideline_type})
-    except TypeError:
-        # Some Chroma versions use `where=` instead of `filter=`
-        return vs.similarity_search(query, k=k, where={"guideline_type": guideline_type})
+    results = vs.similarity_search(
+        query,
+        k=k,
+        filter={"guideline_type": guideline_type},
+    )
+    return [r.page_content for r in results]
 
 
 def get_knowledge_base_status(
@@ -166,23 +155,24 @@ def get_knowledge_base_status(
         embedding = _get_embedding_function()
         vs = _get_chroma(embedding)
 
+        total = None
         type_counts: Dict[str, int] = {}
-        total: Optional[int] = None
 
+        # Best effort count
         try:
             total = int(vs._collection.count())
             for t in required_types:
                 try:
-                    type_counts[t] = int(vs._collection.count(where={"guideline_type": t}))
+                    # count per type isn't directly supported, so do a cheap existence probe
+                    hits = vs.similarity_search("test", k=1, filter={"guideline_type": t})
+                    type_counts[t] = 1 if len(hits) > 0 else 0
                 except Exception:
-                    # fallback: query-based existence check
-                    type_counts[t] = 1 if len(retrieve_guidelines_by_type(t, "test", k=1)) > 0 else 0
+                    type_counts[t] = 0
         except Exception:
-            # fallback if _collection not available
+            # fallback: query-based existence check
             total = 0
             for t in required_types:
                 type_counts[t] = 1 if len(retrieve_guidelines_by_type(t, "test", k=1)) > 0 else 0
-            # if any type exists, we still treat as >0
             total = sum(type_counts.values())
 
         missing = [t for t in required_types if type_counts.get(t, 0) <= 0]
@@ -203,45 +193,23 @@ def get_knowledge_base_status(
         }
 
 
-def ensure_knowledge_base_present(
-    required_types: Optional[List[str]] = None,
-    min_total_chunks: int = 20,
-) -> Dict[str, object]:
+def ensure_knowledge_base_present() -> Dict[str, object]:
     """
-    Ensures a persisted Chroma knowledge base is present locally.
+    Ensures a usable persisted Chroma KB exists at CHROMA_DIR.
 
-    Behavior:
-    - If CHROMA_DIR exists and is non-empty, uses it.
-    - Otherwise, if KB_ZIP_URL is set (e.g., a GitHub Release asset URL),
-      downloads a zip and extracts it into the project root (expects it to contain
-      a `chroma_guidelines/` folder).
-    - Returns `get_knowledge_base_status(...)` either way.
-
-    This lets you build the KB once (admin) and reuse it for all users.
+    - If CHROMA_DIR exists and passes validation: returns status.
+    - If missing and KB_ZIP_URL env var is set: downloads a zip and extracts it.
+      The zip should contain a top-level 'chroma_guidelines/' folder.
+    - Otherwise returns the current status (not ready).
     """
-    # Fast-path: local KB already exists
-    if os.path.exists(CHROMA_DIR):
-        try:
-            if any(True for _ in os.scandir(CHROMA_DIR)):
-                return get_knowledge_base_status(
-                    required_types=required_types,
-                    min_total_chunks=min_total_chunks,
-                )
-        except Exception:
-            # If scandir fails, fall back to status check
-            return get_knowledge_base_status(
-                required_types=required_types,
-                min_total_chunks=min_total_chunks,
-            )
+    status = get_knowledge_base_status()
+    if status.get("ready"):
+        return status
 
-    kb_url = os.getenv("KB_ZIP_URL")
+    kb_url = (os.getenv("KB_ZIP_URL") or "").strip()
     if not kb_url:
-        return get_knowledge_base_status(
-            required_types=required_types,
-            min_total_chunks=min_total_chunks,
-        )
+        return status
 
-    # Attempt download + extract
     try:
         tmpdir = tempfile.mkdtemp(prefix="kb_dl_")
         zpath = os.path.join(tmpdir, "kb.zip")
@@ -249,9 +217,10 @@ def ensure_knowledge_base_present(
         with urllib.request.urlopen(kb_url) as r, open(zpath, "wb") as f:
             shutil.copyfileobj(r, f)
 
-        # Extract into current working directory (project root when run via Streamlit)
         with zipfile.ZipFile(zpath, "r") as z:
             z.extractall(".")
+
+        return get_knowledge_base_status()
 
     except Exception as e:
         return {
@@ -260,8 +229,3 @@ def ensure_knowledge_base_present(
             "type_counts": {},
             "details": f"KB missing and auto-download failed: {e}",
         }
-
-    return get_knowledge_base_status(
-        required_types=required_types,
-        min_total_chunks=min_total_chunks,
-    )
