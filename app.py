@@ -8,7 +8,6 @@ sys.modules["sqlite3"] = sys.modules.pop("pysqlite3", sys.modules.get("sqlite3")
 
 import os
 import tempfile
-from typing import Optional
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -17,15 +16,19 @@ from langchain_community.callbacks import get_openai_callback
 from langchain_openai import ChatOpenAI
 
 import indexer
-from agent_graph import run_graph
+from agent_graph import get_app_graph
+from pdf_reader import summarize_pdf_visuals
 
 load_dotenv()
+
+st.set_page_config(page_title="EuroUrol Checker", layout="wide")
+st.title("🇪🇺 European Urology: Statistical Compliance Widget")
 
 GUIDELINES_DIR = "./guidelines"
 
 MODEL_PRICING_USD_PER_1M = {
-    "gpt-5.2": {"input": 2.50, "output": 10.00},
-    "gpt-5-mini": {"input": 0.50, "output": 2.00},
+    "gpt-5.2": {"input": 1.75, "output": 14.00},
+    "gpt-5-mini": {"input": 0.25, "output": 2.00},
     "gpt-5-nano": {"input": 0.20, "output": 0.80},
     "gpt-4.1": {"input": 2.00, "output": 8.00},
     "gpt-4.1-mini": {"input": 0.80, "output": 3.20},
@@ -33,7 +36,13 @@ MODEL_PRICING_USD_PER_1M = {
 }
 
 
-def _estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> Optional[float]:
+def _guidelines_present() -> bool:
+    return os.path.exists(GUIDELINES_DIR) and any(
+        f.lower().endswith(".pdf") for f in os.listdir(GUIDELINES_DIR)
+    )
+
+
+def _estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float | None:
     pricing = MODEL_PRICING_USD_PER_1M.get(model)
     if not pricing:
         return None
@@ -51,22 +60,19 @@ def _make_llm(model_name: str, temperature: float = 0.0) -> ChatOpenAI:
     return ChatOpenAI(**kwargs)
 
 
-st.set_page_config(page_title="European Urology Checker", layout="wide")
-st.title("European Urology: Manuscript Compliance Checker (Stats + Methods)")
-
 # --- ENV CHECK ---
 if not os.getenv("OPENAI_API_KEY"):
     st.error("⚠️ Missing OPENAI_API_KEY. Set it in .env (local) or in Streamlit Secrets (cloud).")
     st.stop()
 
-# Ensure KB is present (from folder or from ./chroma_guidelines.zip)
+# Ensure KB exists (extract from chroma_guidelines.zip if needed)
 kb_status = indexer.ensure_knowledge_base_present()
 
 # --- SIDEBAR: SETUP ---
 with st.sidebar:
     st.header("1) System Setup")
 
-    # Knowledge base (shared) status
+    # Show KB status
     if kb_status.get("ready"):
         st.success(f"✅ Knowledge base ready ({kb_status['total_chunks']} chunks)")
     else:
@@ -74,8 +80,7 @@ with st.sidebar:
         st.caption(kb_status.get("details", ""))
 
     st.caption(
-        "Guideline PDFs are only needed to (re)build the KB. "
-        "Normal users can run checks if chroma_guidelines/ or chroma_guidelines.zip is present."
+        "Normal users do NOT need guideline PDFs. PDFs are only needed if an admin wants to rebuild the KB."
     )
 
     st.divider()
@@ -98,22 +103,24 @@ with st.sidebar:
 
     st.divider()
 
-    # --- KB build/rebuild (admin-only optional) ---
-    # If you don't set ADMIN_TOKEN, rebuild UI will be shown only when KB is missing AND zip is missing.
+    # --- Admin gate for rebuilding KB ---
     admin_token = (os.getenv("ADMIN_TOKEN") or "").strip()
     is_admin = False
     if admin_token:
-        entered_token = st.text_input("Admin token (only needed to rebuild KB)", type="password")
-        is_admin = bool(entered_token) and (entered_token == admin_token)
+        entered = st.text_input("Admin token (only needed to rebuild KB)", type="password")
+        is_admin = bool(entered) and (entered == admin_token)
 
-    # Allow build UI only if:
-    # - KB is not ready AND there is no committed zip
-    # OR admin token is correct
-    zip_exists = os.path.exists(indexer.KB_ZIP_PATH)
-    allow_build_ui = (not kb_status.get("ready") and not zip_exists) or is_admin
+    # Only show rebuild UI if:
+    # - KB is not ready (emergency), OR
+    # - user is admin
+    if (not kb_status.get("ready")) or is_admin:
+        st.subheader("Upload / Update Guidelines (Admin)")
 
-    if allow_build_ui:
-        st.subheader("Upload / Update Guidelines (Build KB)")
+        if _guidelines_present():
+            st.success("✅ Guidelines present in ./guidelines")
+        else:
+            st.warning("⚠️ Guidelines missing in ./guidelines (only needed to rebuild KB).")
+
         uploaded_guidelines = st.file_uploader(
             "Upload Guideline PDFs",
             type="pdf",
@@ -132,18 +139,13 @@ with st.sidebar:
                             f.write(pdf.getbuffer())
 
                     try:
-                        # admin can force refresh; otherwise build once
-                        force_rebuild = is_admin
-                        indexer.build_knowledge_base(force_rebuild=force_rebuild)
+                        indexer.build_knowledge_base(force_rebuild=True)
                         st.success("✅ Knowledge base built and validated.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error while building/validating knowledge base: {e}")
     else:
-        if kb_status.get("ready"):
-            st.info("Knowledge base available. Upload/rebuild disabled for non-admin users.")
-        else:
-            st.info("KB zip exists; it will be extracted automatically on start. Rebuild disabled for non-admin users.")
+        st.info("KB is ready. Rebuild is disabled for non-admin users.")
 
     st.divider()
     st.subheader("Knowledge base status")
@@ -164,7 +166,8 @@ if uploaded_paper:
         kb_status = indexer.ensure_knowledge_base_present()
         if not kb_status["ready"]:
             st.error(
-                "Vector DB is not ready. Add chroma_guidelines.zip (repo root) or build KB as admin.\n\n"
+                "Vector DB is not ready. Make sure `chroma_guidelines.zip` exists in the repo root "
+                "or ask the admin to rebuild.\n\n"
                 f"Details: {kb_status['details']}"
             )
             st.stop()
@@ -175,12 +178,10 @@ if uploaded_paper:
                 tmp_path = tmp.name
 
             try:
-                # Extract text
                 loader = PyPDFLoader(tmp_path)
                 pages = loader.load()
                 full_text = "\n".join([p.page_content for p in pages])
 
-                # Extract visuals (optional)
                 paper_visuals = ""
                 visuals_used = False
                 visuals_error = ""
@@ -188,44 +189,62 @@ if uploaded_paper:
                 with get_openai_callback() as cb:
                     if use_vision:
                         try:
-                            from pdf_reader import extract_pdf_visuals
-
-                            paper_visuals = extract_pdf_visuals(
-                                tmp_path,
-                                model=vision_model,
+                            llm_vision = _make_llm(model_name=vision_model, temperature=0.0)
+                            paper_visuals = summarize_pdf_visuals(
+                                pdf_path=tmp_path,
+                                llm=llm_vision,
                                 max_pages=max_vision_pages,
+                                zoom=2.0,
                             )
                             visuals_used = True
-                        except Exception as ve:
-                            visuals_error = str(ve)
+                        except Exception as e:
+                            visuals_error = str(e)
+                            paper_visuals = (
+                                "### Visual extracts (from PDF page images)\n\n"
+                                f"_Vision extraction failed: {visuals_error}_\n"
+                            )
 
-                    # Run graph
-                    review_md = run_graph(
-                        paper_text=full_text,
-                        paper_visuals=paper_visuals,
-                        model_name=selected_model,
-                        temperature=temperature,
+                    initial_state = {
+                        "paper_content": full_text,
+                        "paper_visuals": paper_visuals,
+                        "paper_type": "",
+                        "kb_ready": kb_status["ready"],
+                        "kb_details": kb_status["details"],
+                        "visuals_used": visuals_used,
+                        "audit_logs": [],
+                        "final_report": "",
+                    }
+
+                    app_graph = get_app_graph(model_name=selected_model, temperature=temperature)
+                    result = app_graph.invoke(initial_state)
+
+                    review_md = result["final_report"]
+
+                    est_cost = _estimate_cost_usd(
+                        selected_model,
+                        prompt_tokens=cb.prompt_tokens,
+                        completion_tokens=cb.completion_tokens,
                     )
 
-                    prompt_tokens = cb.prompt_tokens
-                    completion_tokens = cb.completion_tokens
-                    total_tokens = cb.total_tokens
+                    cost_block = (
+                        "\n\n---\n\n"
+                        "### Run usage & cost estimate\n"
+                        f"- Model: `{selected_model}`\n"
+                        f"- Prompt tokens: **{cb.prompt_tokens:,}**\n"
+                        f"- Output tokens: **{cb.completion_tokens:,}**\n"
+                        f"- Total tokens: **{cb.total_tokens:,}**\n"
+                    )
+                    if est_cost is None:
+                        cost_block += "- Estimated cost: **N/A (model not in local pricing table)**\n"
+                    else:
+                        cost_block += f"- Estimated cost: **${est_cost:.6f}**\n"
 
-                # Cost estimation
-                cost = _estimate_cost_usd(selected_model, prompt_tokens, completion_tokens)
-                cost_block = "\n\n---\n"
-                cost_block += f"**Token usage:** prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}\n"
-                if cost is not None:
-                    cost_block += f"**Estimated cost:** ${cost:.4f}\n"
-                else:
-                    cost_block += "**Estimated cost:** unknown (pricing not configured for this model)\n"
-
-                if visuals_used:
-                    cost_block += "**Vision:** enabled\n"
-                else:
-                    cost_block += "**Vision:** disabled\n"
-                    if visuals_error:
-                        cost_block += f"**Vision error:** {visuals_error}\n"
+                    if visuals_used:
+                        cost_block += "- Vision: **enabled**\n"
+                    else:
+                        cost_block += "- Vision: **disabled**\n"
+                        if visuals_error:
+                            cost_block += f"- Vision error: `{visuals_error}`\n"
 
                 st.subheader("📄 Review Output")
                 st.markdown(review_md)
