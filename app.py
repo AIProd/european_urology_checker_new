@@ -8,6 +8,7 @@ sys.modules["sqlite3"] = sys.modules.pop("pysqlite3", sys.modules.get("sqlite3")
 
 import os
 import tempfile
+from typing import Optional
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -32,13 +33,7 @@ MODEL_PRICING_USD_PER_1M = {
 }
 
 
-def _guidelines_present() -> bool:
-    return os.path.exists(GUIDELINES_DIR) and any(
-        f.lower().endswith(".pdf") for f in os.listdir(GUIDELINES_DIR)
-    )
-
-
-def _estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float | None:
+def _estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> Optional[float]:
     pricing = MODEL_PRICING_USD_PER_1M.get(model)
     if not pricing:
         return None
@@ -64,7 +59,7 @@ if not os.getenv("OPENAI_API_KEY"):
     st.error("⚠️ Missing OPENAI_API_KEY. Set it in .env (local) or in Streamlit Secrets (cloud).")
     st.stop()
 
-# Try to ensure KB exists (download if KB_ZIP_URL configured)
+# Ensure KB is present (from folder or from ./chroma_guidelines.zip)
 kb_status = indexer.ensure_knowledge_base_present()
 
 # --- SIDEBAR: SETUP ---
@@ -78,7 +73,10 @@ with st.sidebar:
         st.error("❌ Knowledge base NOT ready")
         st.caption(kb_status.get("details", ""))
 
-    st.caption("Guideline PDFs are only needed to (re)build the KB. Normal users can run checks without uploading PDFs.")
+    st.caption(
+        "Guideline PDFs are only needed to (re)build the KB. "
+        "Normal users can run checks if chroma_guidelines/ or chroma_guidelines.zip is present."
+    )
 
     st.divider()
     st.subheader("Model selection (text analysis)")
@@ -90,7 +88,6 @@ with st.sidebar:
     st.subheader("Figure/Table reading (Vision)")
     use_vision = st.checkbox("Analyze figures/tables from PDF images", value=True)
 
-    # Safer default: use a known multimodal model for vision
     vision_model = st.selectbox(
         "Vision model",
         ["gpt-5.2", "gpt-4.1"],
@@ -100,20 +97,23 @@ with st.sidebar:
     max_vision_pages = st.slider("Max pages to analyze with vision", 2, 20, 14, disabled=not use_vision)
 
     st.divider()
-    # --- KB build/rebuild (admin) ---
-    kb_url = (os.getenv("KB_ZIP_URL") or "").strip()
-    admin_token = (os.getenv("ADMIN_TOKEN") or "").strip()
 
+    # --- KB build/rebuild (admin-only optional) ---
+    # If you don't set ADMIN_TOKEN, rebuild UI will be shown only when KB is missing AND zip is missing.
+    admin_token = (os.getenv("ADMIN_TOKEN") or "").strip()
     is_admin = False
     if admin_token:
         entered_token = st.text_input("Admin token (only needed to rebuild KB)", type="password")
         is_admin = bool(entered_token) and (entered_token == admin_token)
 
-    # If KB_ZIP_URL is configured, normal users should not build locally.
-    allow_build_ui = ((not kb_status.get("ready")) and (not kb_url)) or is_admin
+    # Allow build UI only if:
+    # - KB is not ready AND there is no committed zip
+    # OR admin token is correct
+    zip_exists = os.path.exists(indexer.KB_ZIP_PATH)
+    allow_build_ui = (not kb_status.get("ready") and not zip_exists) or is_admin
 
     if allow_build_ui:
-        st.subheader("Upload / Update Guidelines")
+        st.subheader("Upload / Update Guidelines (Build KB)")
         uploaded_guidelines = st.file_uploader(
             "Upload Guideline PDFs",
             type="pdf",
@@ -132,17 +132,18 @@ with st.sidebar:
                             f.write(pdf.getbuffer())
 
                     try:
-                        # If KB isn't ready, it's safe to rebuild. Admin token allows forced refresh anytime.
-                        force_rebuild = is_admin or (not kb_status.get("ready"))
+                        # admin can force refresh; otherwise build once
+                        force_rebuild = is_admin
                         indexer.build_knowledge_base(force_rebuild=force_rebuild)
                         st.success("✅ Knowledge base built and validated.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error while building/validating knowledge base: {e}")
     else:
-        st.info("Knowledge base already available. Upload/rebuild is disabled for non-admin users.")
-        if kb_url:
-            st.caption("KB is expected to be auto-downloaded from KB_ZIP_URL when missing.")
+        if kb_status.get("ready"):
+            st.info("Knowledge base available. Upload/rebuild disabled for non-admin users.")
+        else:
+            st.info("KB zip exists; it will be extracted automatically on start. Rebuild disabled for non-admin users.")
 
     st.divider()
     st.subheader("Knowledge base status")
@@ -163,7 +164,7 @@ if uploaded_paper:
         kb_status = indexer.ensure_knowledge_base_present()
         if not kb_status["ready"]:
             st.error(
-                "Vector DB is not ready. Ask the admin to provide/build the KB.\n\n"
+                "Vector DB is not ready. Add chroma_guidelines.zip (repo root) or build KB as admin.\n\n"
                 f"Details: {kb_status['details']}"
             )
             st.stop()
@@ -174,12 +175,12 @@ if uploaded_paper:
                 tmp_path = tmp.name
 
             try:
-                # Extract text (fast)
+                # Extract text
                 loader = PyPDFLoader(tmp_path)
                 pages = loader.load()
                 full_text = "\n".join([p.page_content for p in pages])
 
-                # Extract visuals (true figure reading)
+                # Extract visuals (optional)
                 paper_visuals = ""
                 visuals_used = False
                 visuals_error = ""
