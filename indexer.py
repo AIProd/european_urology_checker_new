@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 import zipfile
+import urllib.request
 from typing import List, Dict, Optional
 
 from dotenv import load_dotenv
@@ -18,20 +19,19 @@ GUIDELINES_DIR = "./guidelines"
 CHROMA_DIR = "./chroma_guidelines"
 CHROMA_COLLECTION = "eu_guidelines"
 
-# If you commit the zip into the repo root, keep it here:
-KB_ZIP_PATH = "./chroma_guidelines.zip"
+# If you commit the KB zip in repo root, keep it here:
+DEFAULT_KB_ZIP_PATH = "./chroma_guidelines.zip"
 
 
 def infer_guideline_type(filename: str) -> str:
-    """Heuristic mapping based on filename."""
-    n = filename.lower()
-    if "figure" in n or "table" in n or "fig" in n:
-        return "figures_tables"
-    if "causal" in n or "causality" in n:
+    fn = filename.lower()
+    if "causality" in fn:
         return "causality"
-    if "systematic" in n or "meta" in n:
+    if "figure" in fn or "table" in fn:
+        return "figures_tables"
+    if "systematic" in fn or "meta" in fn:
         return "systematic_meta"
-    if "stat" in n or "statistics" in n or "p-value" in n:
+    if "stat" in fn:
         return "statistics"
     return "other"
 
@@ -48,38 +48,40 @@ def _get_embedding_function() -> OpenAIEmbeddings:
     base_url = os.getenv("OPENAI_BASE_URL")
     embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
 
-    kwargs = {"model": embedding_model}
+    kwargs = {"model": embedding_model, "api_key": os.getenv("OPENAI_API_KEY")}
     if base_url:
         kwargs["base_url"] = base_url
+
     return OpenAIEmbeddings(**kwargs)
 
 
 def _load_guideline_docs() -> List[Document]:
     if not os.path.exists(GUIDELINES_DIR):
         raise FileNotFoundError(
-            f"Guidelines folder not found: {GUIDELINES_DIR}. Create it and add PDFs."
+            f"Guidelines folder '{GUIDELINES_DIR}' not found. "
+            "Upload the EU guideline PDFs via the Streamlit sidebar first."
         )
 
-    pdfs = [f for f in os.listdir(GUIDELINES_DIR) if f.lower().endswith(".pdf")]
-    if not pdfs:
-        raise FileNotFoundError(f"No PDFs found in {GUIDELINES_DIR}.")
+    pdf_files = [f for f in os.listdir(GUIDELINES_DIR) if f.lower().endswith(".pdf")]
+    if not pdf_files:
+        raise RuntimeError(f"No PDF files found in {GUIDELINES_DIR}. Upload the guideline PDFs there.")
 
-    docs: List[Document] = []
-    for pdf in pdfs:
-        path = os.path.join(GUIDELINES_DIR, pdf)
+    documents: List[Document] = []
+    for file in pdf_files:
+        path = os.path.join(GUIDELINES_DIR, file)
         loader = PyPDFLoader(path)
-        loaded = loader.load()
-        gtype = infer_guideline_type(pdf)
-        for d in loaded:
+        docs = loader.load()
+        gtype = infer_guideline_type(file)
+        for d in docs:
+            d.metadata["source_doc"] = file
             d.metadata["guideline_type"] = gtype
-            d.metadata["source_pdf"] = pdf
-        docs.extend(loaded)
+        documents.extend(docs)
 
-    return docs
+    return documents
 
 
 def _split_docs(docs: List[Document]) -> List[Document]:
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=150)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1100, chunk_overlap=120)
     return splitter.split_documents(docs)
 
 
@@ -91,22 +93,34 @@ def _get_chroma(embedding: OpenAIEmbeddings) -> Chroma:
     )
 
 
-def build_knowledge_base(force_rebuild: bool = False) -> None:
+def _safe_extract_zip(zip_path: str, extract_to: str = ".") -> None:
     """
-    Builds the Chroma persisted vector DB in CHROMA_DIR.
+    Safely extracts a zip file, preventing path traversal.
+    Expects the zip to contain a top-level folder 'chroma_guidelines/'.
+    """
+    with zipfile.ZipFile(zip_path, "r") as z:
+        for member in z.namelist():
+            # Prevent absolute paths and ../ traversal
+            if member.startswith("/") or member.startswith("\\") or ".." in member.replace("\\", "/").split("/"):
+                raise RuntimeError(f"Unsafe path in zip: {member}")
+        z.extractall(extract_to)
 
-    - If CHROMA_DIR already exists and looks valid, this does nothing unless force_rebuild=True.
-    - If force_rebuild=True, CHROMA_DIR is wiped and rebuilt from PDFs in GUIDELINES_DIR.
-    """
+
+def build_knowledge_base(force_rebuild: bool = False) -> None:
     docs = _load_guideline_docs()
     chunks = _split_docs(docs)
     embedding = _get_embedding_function()
 
+    # If KB already ready and not forcing rebuild, skip.
     if (not force_rebuild) and os.path.exists(CHROMA_DIR):
-        status = get_knowledge_base_status()
-        if status.get("ready"):
-            print(f"ℹ️ KB already ready at {CHROMA_DIR}. Skipping rebuild.")
-            return
+        try:
+            status = get_knowledge_base_status()
+            if status.get("ready"):
+                print(f"ℹ️ KB already ready at {CHROMA_DIR}. Skipping rebuild.")
+                return
+        except Exception:
+            # If status check fails, proceed to rebuild attempt
+            pass
 
     if force_rebuild and os.path.exists(CHROMA_DIR):
         shutil.rmtree(CHROMA_DIR, ignore_errors=True)
@@ -115,16 +129,21 @@ def build_knowledge_base(force_rebuild: bool = False) -> None:
     vs.add_documents(chunks)
     vs.persist()
 
+    # Validation
     status = get_knowledge_base_status()
     if not status["ready"]:
-        raise RuntimeError(
-            f"Vector DB build completed but validation failed: {status.get('details')}"
-        )
+        raise RuntimeError(f"Vector DB build completed but validation failed: {status['details']}")
 
     print(f"✅ Built Chroma KB at {CHROMA_DIR} with {len(chunks)} chunks.")
 
 
-def retrieve_guidelines_by_type(guideline_type: str, query: str, k: int = 6) -> List[str]:
+def retrieve_guidelines_by_type(guideline_type: str, query: str, k: int = 5) -> List[Document]:
+    if not os.path.exists(CHROMA_DIR):
+        raise RuntimeError(
+            f"Chroma KB not found at '{CHROMA_DIR}'. "
+            "KB must be present (via extracted zip or built by admin)."
+        )
+
     embedding = _get_embedding_function()
     vs = _get_chroma(embedding)
 
@@ -133,16 +152,13 @@ def retrieve_guidelines_by_type(guideline_type: str, query: str, k: int = 6) -> 
         k=k,
         filter={"guideline_type": guideline_type},
     )
-    return [r.page_content for r in results]
+    return results
 
 
 def get_knowledge_base_status(
     required_types: Optional[List[str]] = None,
     min_total_chunks: int = 20,
 ) -> Dict[str, object]:
-    """
-    Readiness check for the persisted KB.
-    """
     if required_types is None:
         required_types = ["statistics", "figures_tables", "causality", "systematic_meta"]
 
@@ -158,26 +174,29 @@ def get_knowledge_base_status(
         embedding = _get_embedding_function()
         vs = _get_chroma(embedding)
 
+        total = None
         type_counts: Dict[str, int] = {}
-        total = 0
 
-        # total chunk count (best-effort)
         try:
-            total = int(vs._collection.count())  # type: ignore[attr-defined]
+            total = int(vs._collection.count())
+            for t in required_types:
+                try:
+                    hits = vs.similarity_search("test", k=1, filter={"guideline_type": t})
+                    type_counts[t] = 1 if len(hits) > 0 else 0
+                except Exception:
+                    type_counts[t] = 0
         except Exception:
             total = 0
-
-        # required types presence probe
-        for t in required_types:
-            try:
-                hits = vs.similarity_search("probe", k=1, filter={"guideline_type": t})
-                type_counts[t] = 1 if hits else 0
-            except Exception:
-                type_counts[t] = 0
+            for t in required_types:
+                try:
+                    type_counts[t] = 1 if len(retrieve_guidelines_by_type(t, "test", k=1)) > 0 else 0
+                except Exception:
+                    type_counts[t] = 0
+            total = sum(type_counts.values())
 
         missing = [t for t in required_types if type_counts.get(t, 0) <= 0]
-        ready = (total >= min_total_chunks) and (len(missing) == 0)
 
+        ready = (total is not None and total >= min_total_chunks and len(missing) == 0)
         details = f"Vector DB {'OK' if ready else 'NOT ready'}: {total} chunks available."
         if missing:
             details += f" Missing types: {missing}"
@@ -193,60 +212,61 @@ def get_knowledge_base_status(
         }
 
 
-def _safe_extract_zip(zip_path: str, dest_dir: str) -> None:
-    """
-    Safe-ish zip extraction: prevents Zip Slip by validating paths.
-    Extracts to current project (dest_dir is usually ".").
-    """
-    with zipfile.ZipFile(zip_path, "r") as z:
-        for member in z.infolist():
-            member_path = member.filename
-
-            # Skip weird entries
-            if not member_path or member_path.endswith("/") and member.file_size == 0:
-                continue
-
-            # Resolve final path
-            final_path = os.path.normpath(os.path.join(dest_dir, member_path))
-            dest_abs = os.path.abspath(dest_dir)
-            final_abs = os.path.abspath(final_path)
-
-            if not final_abs.startswith(dest_abs + os.sep) and final_abs != dest_abs:
-                raise RuntimeError(f"Unsafe zip path detected: {member_path}")
-
-        z.extractall(dest_dir)
-
-
 def ensure_knowledge_base_present() -> Dict[str, object]:
     """
     Ensures a usable persisted Chroma KB exists at CHROMA_DIR.
 
-    Priority:
-    1) If CHROMA_DIR already exists & validates -> use it
-    2) Else if KB_ZIP_PATH exists -> extract it to create CHROMA_DIR
-    3) Else -> not ready
+    Order:
+    1) If CHROMA_DIR exists & validates -> OK
+    2) Else if local zip exists (committed in repo) -> extract -> validate
+    3) Else if KB_ZIP_URL env set -> download -> extract -> validate
+    4) Else -> NOT ready
     """
     status = get_knowledge_base_status()
     if status.get("ready"):
         return status
 
-    if os.path.exists(KB_ZIP_PATH):
+    # 2) Try local zip (committed in repo)
+    kb_zip_path = (os.getenv("KB_ZIP_PATH") or DEFAULT_KB_ZIP_PATH).strip()
+    if kb_zip_path and os.path.exists(kb_zip_path):
         try:
-            # Extract zip into repo root; it should contain chroma_guidelines/...
-            _safe_extract_zip(KB_ZIP_PATH, ".")
-            return get_knowledge_base_status()
+            # If there's a broken/partial folder, remove it before extract
+            if os.path.exists(CHROMA_DIR):
+                shutil.rmtree(CHROMA_DIR, ignore_errors=True)
+
+            _safe_extract_zip(kb_zip_path, extract_to=".")
+            status2 = get_knowledge_base_status()
+            if status2.get("ready"):
+                return status2
         except Exception as e:
             return {
                 "ready": False,
                 "total_chunks": 0,
                 "type_counts": {},
-                "details": f"KB zip found at {KB_ZIP_PATH} but extraction/validation failed: {e}",
+                "details": f"Found local KB zip but extraction/validation failed: {e}",
             }
 
-    # Nothing available
-    return {
-        "ready": False,
-        "total_chunks": 0,
-        "type_counts": {},
-        "details": f"KB missing: {CHROMA_DIR} not found and {KB_ZIP_PATH} not found.",
-    }
+    # 3) Optional: remote zip download (if you ever want it later)
+    kb_url = (os.getenv("KB_ZIP_URL") or "").strip()
+    if kb_url:
+        try:
+            tmpdir = tempfile.mkdtemp(prefix="kb_dl_")
+            zpath = os.path.join(tmpdir, "kb.zip")
+            with urllib.request.urlopen(kb_url) as r, open(zpath, "wb") as f:
+                shutil.copyfileobj(r, f)
+
+            if os.path.exists(CHROMA_DIR):
+                shutil.rmtree(CHROMA_DIR, ignore_errors=True)
+
+            _safe_extract_zip(zpath, extract_to=".")
+            status3 = get_knowledge_base_status()
+            return status3
+        except Exception as e:
+            return {
+                "ready": False,
+                "total_chunks": 0,
+                "type_counts": {},
+                "details": f"KB missing and remote auto-download failed: {e}",
+            }
+
+    return status
