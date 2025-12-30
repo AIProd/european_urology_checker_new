@@ -3,7 +3,6 @@ import os
 import shutil
 import tempfile
 import zipfile
-import urllib.request
 from typing import List, Dict, Optional
 
 from dotenv import load_dotenv
@@ -18,6 +17,9 @@ load_dotenv()
 GUIDELINES_DIR = "./guidelines"
 CHROMA_DIR = "./chroma_guidelines"
 CHROMA_COLLECTION = "eu_guidelines"
+
+# If you commit the zip into the repo root, keep it here:
+KB_ZIP_PATH = "./chroma_guidelines.zip"
 
 
 def infer_guideline_type(filename: str) -> str:
@@ -90,21 +92,21 @@ def _get_chroma(embedding: OpenAIEmbeddings) -> Chroma:
 
 
 def build_knowledge_base(force_rebuild: bool = False) -> None:
+    """
+    Builds the Chroma persisted vector DB in CHROMA_DIR.
+
+    - If CHROMA_DIR already exists and looks valid, this does nothing unless force_rebuild=True.
+    - If force_rebuild=True, CHROMA_DIR is wiped and rebuilt from PDFs in GUIDELINES_DIR.
+    """
     docs = _load_guideline_docs()
     chunks = _split_docs(docs)
     embedding = _get_embedding_function()
 
-    # Avoid accidental duplicate-ingestion:
-    # If the KB is already ready and force_rebuild is False, do nothing.
     if (not force_rebuild) and os.path.exists(CHROMA_DIR):
-        try:
-            status = get_knowledge_base_status()
-            if status.get("ready"):
-                print(f"ℹ️ KB already ready at {CHROMA_DIR}. Skipping rebuild.")
-                return
-        except Exception:
-            # If status check fails, continue with build attempt.
-            pass
+        status = get_knowledge_base_status()
+        if status.get("ready"):
+            print(f"ℹ️ KB already ready at {CHROMA_DIR}. Skipping rebuild.")
+            return
 
     if force_rebuild and os.path.exists(CHROMA_DIR):
         shutil.rmtree(CHROMA_DIR, ignore_errors=True)
@@ -113,10 +115,11 @@ def build_knowledge_base(force_rebuild: bool = False) -> None:
     vs.add_documents(chunks)
     vs.persist()
 
-    # Validation
     status = get_knowledge_base_status()
     if not status["ready"]:
-        raise RuntimeError(f"Vector DB build completed but validation failed: {status['details']}")
+        raise RuntimeError(
+            f"Vector DB build completed but validation failed: {status.get('details')}"
+        )
 
     print(f"✅ Built Chroma KB at {CHROMA_DIR} with {len(chunks)} chunks.")
 
@@ -138,7 +141,7 @@ def get_knowledge_base_status(
     min_total_chunks: int = 20,
 ) -> Dict[str, object]:
     """
-    Hard readiness check so you can BLOCK runs if the DB is empty/missing key types.
+    Readiness check for the persisted KB.
     """
     if required_types is None:
         required_types = ["statistics", "figures_tables", "causality", "systematic_meta"]
@@ -148,36 +151,33 @@ def get_knowledge_base_status(
             "ready": False,
             "total_chunks": 0,
             "type_counts": {},
-            "details": f"Chroma directory not found at {CHROMA_DIR}. Build the KB first.",
+            "details": f"Chroma directory not found at {CHROMA_DIR}.",
         }
 
     try:
         embedding = _get_embedding_function()
         vs = _get_chroma(embedding)
 
-        total = None
         type_counts: Dict[str, int] = {}
+        total = 0
 
-        # Best effort count
+        # total chunk count (best-effort)
         try:
-            total = int(vs._collection.count())
-            for t in required_types:
-                try:
-                    # count per type isn't directly supported, so do a cheap existence probe
-                    hits = vs.similarity_search("test", k=1, filter={"guideline_type": t})
-                    type_counts[t] = 1 if len(hits) > 0 else 0
-                except Exception:
-                    type_counts[t] = 0
+            total = int(vs._collection.count())  # type: ignore[attr-defined]
         except Exception:
-            # fallback: query-based existence check
             total = 0
-            for t in required_types:
-                type_counts[t] = 1 if len(retrieve_guidelines_by_type(t, "test", k=1)) > 0 else 0
-            total = sum(type_counts.values())
+
+        # required types presence probe
+        for t in required_types:
+            try:
+                hits = vs.similarity_search("probe", k=1, filter={"guideline_type": t})
+                type_counts[t] = 1 if hits else 0
+            except Exception:
+                type_counts[t] = 0
 
         missing = [t for t in required_types if type_counts.get(t, 0) <= 0]
+        ready = (total >= min_total_chunks) and (len(missing) == 0)
 
-        ready = (total is not None and total >= min_total_chunks and len(missing) == 0)
         details = f"Vector DB {'OK' if ready else 'NOT ready'}: {total} chunks available."
         if missing:
             details += f" Missing types: {missing}"
@@ -193,39 +193,60 @@ def get_knowledge_base_status(
         }
 
 
+def _safe_extract_zip(zip_path: str, dest_dir: str) -> None:
+    """
+    Safe-ish zip extraction: prevents Zip Slip by validating paths.
+    Extracts to current project (dest_dir is usually ".").
+    """
+    with zipfile.ZipFile(zip_path, "r") as z:
+        for member in z.infolist():
+            member_path = member.filename
+
+            # Skip weird entries
+            if not member_path or member_path.endswith("/") and member.file_size == 0:
+                continue
+
+            # Resolve final path
+            final_path = os.path.normpath(os.path.join(dest_dir, member_path))
+            dest_abs = os.path.abspath(dest_dir)
+            final_abs = os.path.abspath(final_path)
+
+            if not final_abs.startswith(dest_abs + os.sep) and final_abs != dest_abs:
+                raise RuntimeError(f"Unsafe zip path detected: {member_path}")
+
+        z.extractall(dest_dir)
+
+
 def ensure_knowledge_base_present() -> Dict[str, object]:
     """
     Ensures a usable persisted Chroma KB exists at CHROMA_DIR.
 
-    - If CHROMA_DIR exists and passes validation: returns status.
-    - If missing and KB_ZIP_URL env var is set: downloads a zip and extracts it.
-      The zip should contain a top-level 'chroma_guidelines/' folder.
-    - Otherwise returns the current status (not ready).
+    Priority:
+    1) If CHROMA_DIR already exists & validates -> use it
+    2) Else if KB_ZIP_PATH exists -> extract it to create CHROMA_DIR
+    3) Else -> not ready
     """
     status = get_knowledge_base_status()
     if status.get("ready"):
         return status
 
-    kb_url = (os.getenv("KB_ZIP_URL") or "").strip()
-    if not kb_url:
-        return status
+    if os.path.exists(KB_ZIP_PATH):
+        try:
+            # Extract zip into repo root; it should contain chroma_guidelines/...
+            _safe_extract_zip(KB_ZIP_PATH, ".")
+            return get_knowledge_base_status()
+        except Exception as e:
+            return {
+                "ready": False,
+                "total_chunks": 0,
+                "type_counts": {},
+                "details": f"KB zip found at {KB_ZIP_PATH} but extraction/validation failed: {e}",
+            }
 
-    try:
-        tmpdir = tempfile.mkdtemp(prefix="kb_dl_")
-        zpath = os.path.join(tmpdir, "kb.zip")
-
-        with urllib.request.urlopen(kb_url) as r, open(zpath, "wb") as f:
-            shutil.copyfileobj(r, f)
-
-        with zipfile.ZipFile(zpath, "r") as z:
-            z.extractall(".")
-
-        return get_knowledge_base_status()
-
-    except Exception as e:
-        return {
-            "ready": False,
-            "total_chunks": 0,
-            "type_counts": {},
-            "details": f"KB missing and auto-download failed: {e}",
-        }
+    # Nothing available
+    return {
+        "ready": False,
+        "total_chunks": 0,
+        "type_counts": {},
+        "details": f"KB missing: {CHROMA_DIR} not found and {KB_ZIP_PATH} not found.",
+    }
